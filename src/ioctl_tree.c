@@ -19,13 +19,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <assert.h>
 #include <errno.h>
 #include <linux/ioctl.h>
 #include <linux/usbdevice_fs.h>
 #include <linux/input.h>
+#include <linux/hidraw.h>
 
 #include "debug.h"
+#include "utils.h"
 #include "ioctl_tree.h"
 
 #define TRUE 1
@@ -33,16 +36,6 @@
 
 #define UNUSED __attribute__ ((unused))
 
-static void *
-callocx (size_t nmemb, size_t size)
-{
-  void *r = calloc (nmemb, size);
-  if (r == NULL) {
-      perror ("failed to allocate memory");
-      abort ();
-  }
-  return r;
-}
 
 /***********************************
  *
@@ -308,10 +301,17 @@ ioctl_tree_next(const ioctl_tree * node)
 	return node->child;
     if (node->next != NULL)
 	return node->next;
+
+    /* HACK: -fanalyzer does not understand this loop */
+#pragma GCC diagnostic push
+#if !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wanalyzer-deref-before-check"
+#endif
     /* walk up the parents until we find an alternative sibling */
     for (; node != NULL; node = node->parent)
 	if (node->next != NULL)
 	    return node->next;
+#pragma GCC diagnostic pop
 
     /* no alternative siblings left, iteration done */
     return NULL;
@@ -327,7 +327,7 @@ ioctl_node_list *
 ioctl_node_list_new(void)
 {
     ioctl_node_list *l;
-    l = malloc(sizeof(ioctl_node_list));
+    l = mallocx(sizeof(ioctl_node_list));
     l->n = 0;
     l->capacity = 10;
     l->items = callocx(sizeof(ioctl_tree *), l->capacity);
@@ -346,9 +346,16 @@ void
 ioctl_node_list_append(ioctl_node_list * list, ioctl_tree * element)
 {
     if (list->n == list->capacity) {
+	assert(list->capacity < SIZE_MAX / 2);
 	list->capacity *= 2;
-	list->items = realloc(list->items, list->capacity * sizeof(ioctl_tree *));
+    /* HACK: -fanalyzer incorrectly treats this as memory leak */
+#pragma GCC diagnostic push
+#if !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
+#endif
+	list->items = reallocarray(list->items, list->capacity, sizeof(ioctl_tree *));
 	assert(list->items != NULL);
+#pragma GCC diagnostic pop
     }
 
     list->items[list->n++] = element;
@@ -495,7 +502,7 @@ static void
 ioctl_simplestruct_init_from_bin(ioctl_tree * node, const void *data)
 {
     DBG(DBG_IOCTL_TREE, "ioctl_simplestruct_init_from_bin: %s(%X): size is %u bytes\n", node->type->name, (unsigned) node->id, (unsigned) NSIZE(node));
-    node->data = malloc(NSIZE(node));
+    node->data = mallocx(NSIZE(node));
     memcpy(node->data, data, NSIZE(node));
 }
 
@@ -506,7 +513,7 @@ ioctl_simplestruct_init_from_text(ioctl_tree * node, const char *data)
      * correct length for data; this happens for variable length ioctls such as
      * EVIOCGBIT */
     size_t data_len = strlen(data) / 2;
-    node->data = malloc(data_len);
+    node->data = mallocx(data_len);
 
     if (NSIZE(node) != data_len) {
 	DBG(DBG_IOCTL_TREE, "ioctl_simplestruct_init_from_text: adjusting ioctl ID %X (size %u) to actual data length %zu\n",
@@ -569,7 +576,7 @@ ioctl_varlenstruct_init_from_bin(ioctl_tree * node, const void *data)
 {
     size_t size = node->type->get_data_size(node->id, data);
     DBG(DBG_IOCTL_TREE, "ioctl_varlenstruct_init_from_bin: %s(%X): size is %zu bytes\n", node->type->name, (unsigned) node->id, size);
-    node->data = malloc(size);
+    node->data = mallocx(size);
     memcpy(node->data, data, size);
 }
 
@@ -578,7 +585,7 @@ ioctl_varlenstruct_init_from_text(ioctl_tree * node, const char *data)
 {
     size_t data_len = strlen(data) / 2;
 
-    node->data = malloc(data_len);
+    node->data = mallocx(data_len);
 
     if (!read_hex(data, node->data, data_len)) {
 	fprintf(stderr, "ioctl_varlenstruct_init_from_text: failed to parse '%s'\n", data);
@@ -944,6 +951,27 @@ ioctl_type ioctl_db[] = {
     I_NAMED_SIMPLE_STRUCT_IN(EVIOCGMTSLOTS(32), "EVIOCGMTSLOTS", 0, ioctl_insertion_parent_stateless),
 #endif
 
+    /* hidraw */
+    I_SIMPLE_STRUCT_IN(HIDIOCGRDESCSIZE, 0, ioctl_insertion_parent_stateless),
+    I_SIMPLE_STRUCT_IN(HIDIOCGRDESC, 0, ioctl_insertion_parent_stateless),
+    I_SIMPLE_STRUCT_IN(HIDIOCGRAWINFO, 0, ioctl_insertion_parent_stateless),
+    /* we define these with len==32, but they apply to any len */
+    I_NAMED_SIMPLE_STRUCT_IN(HIDIOCGRAWNAME(32), "HIDIOCGRAWNAME", 0, ioctl_insertion_parent_stateless),
+    I_NAMED_SIMPLE_STRUCT_IN(HIDIOCGRAWPHYS(32), "HIDIOCGRAWPHYS", 0, ioctl_insertion_parent_stateless),
+    I_NAMED_SIMPLE_STRUCT_IN(HIDIOCSFEATURE(32), "HIDIOCSFEATURE", 0, ioctl_insertion_parent_stateless),
+    I_NAMED_SIMPLE_STRUCT_IN(HIDIOCGFEATURE(32), "HIDIOCGFEATURE", 0, ioctl_insertion_parent_stateless),
+    /* this was introduced not too long ago */
+#ifdef HIDIOCGRAWUNIQ
+    I_NAMED_SIMPLE_STRUCT_IN(HIDIOCGRAWUNIQ(32), "HIDIOCGRAWUNIQ", 0, ioctl_insertion_parent_stateless),
+#endif
+    /* these were introduced not too long ago */
+#ifdef HIDIOCSINPUT
+    I_NAMED_SIMPLE_STRUCT_IN(HIDIOCSINPUT(32), "HIDIOCSINPUT", 0, ioctl_insertion_parent_stateless),
+    I_NAMED_SIMPLE_STRUCT_IN(HIDIOCGINPUT(32), "HIDIOCGINPUT", 0, ioctl_insertion_parent_stateless),
+    I_NAMED_SIMPLE_STRUCT_IN(HIDIOCSOUTPUT(32), "HIDIOCSOUTPUT", 0, ioctl_insertion_parent_stateless),
+    I_NAMED_SIMPLE_STRUCT_IN(HIDIOCGOUTPUT(32), "HIDIOCGOUTPUT", 0, ioctl_insertion_parent_stateless),
+#endif
+
     /* terminator */
     {0, 0, 0, "", NULL, NULL, NULL, NULL, NULL}
 };
@@ -977,7 +1005,7 @@ ioctl_type_get_by_name(const char *name, IOCTL_REQUEST_TYPE *out_id)
     long offset = 0;
 
     /* chop off real name from offset */
-    real_name = strdup(name);
+    real_name = strdupx(name);
     parens = strchr(real_name, '(');
     if (parens != NULL) {
 	*parens = '\0';

@@ -35,6 +35,7 @@
 #include <dlfcn.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,16 +48,19 @@
 #include <sys/sysmacros.h>
 #include <sys/inotify.h>
 #include <sys/socket.h>
+#include <sys/vfs.h>
 #include <sys/xattr.h>
 #include <linux/ioctl.h>
 #include <linux/un.h>
 #include <linux/netlink.h>
 #include <linux/input.h>
+#include <linux/magic.h>
 #include <unistd.h>
 #include <pthread.h>
 
 #include "config.h"
 #include "debug.h"
+#include "utils.h"
 #include "ioctl_tree.h"
 
 /* fix missing O_TMPFILE on some systems */
@@ -127,12 +131,23 @@ path_exists(const char *path)
 
 /* multi-thread locking for trap_path users */
 pthread_mutex_t trap_path_lock = PTHREAD_MUTEX_INITIALIZER;
+static sigset_t trap_path_sig_restore;
 
 /* multi-thread locking for ioctls */
 pthread_mutex_t ioctl_lock = PTHREAD_MUTEX_INITIALIZER;
 
-#define TRAP_PATH_LOCK pthread_mutex_lock (&trap_path_lock)
-#define TRAP_PATH_UNLOCK pthread_mutex_unlock (&trap_path_lock)
+#define TRAP_PATH_LOCK \
+    do { \
+        sigset_t sig_set; \
+        sigfillset(&sig_set); \
+        pthread_sigmask(SIG_SETMASK, &sig_set, &trap_path_sig_restore); \
+        pthread_mutex_lock (&trap_path_lock); \
+    } while (0)
+#define TRAP_PATH_UNLOCK \
+    do { \
+        pthread_mutex_unlock (&trap_path_lock); \
+        pthread_sigmask(SIG_SETMASK, &trap_path_sig_restore, NULL); \
+    } while (0)
 
 #define IOCTL_LOCK pthread_mutex_lock (&ioctl_lock)
 #define IOCTL_UNLOCK pthread_mutex_unlock (&ioctl_lock)
@@ -170,6 +185,8 @@ trap_path(const char *path)
 
     if (strncmp(abspath, "/dev/", 5) == 0 || strcmp(abspath, "/dev") == 0 || strncmp(abspath, "/proc/", 6) == 0)
 	check_exist = 1;
+    else if (strncmp(abspath, "/run/udev/data", 14) == 0)
+	check_exist = 0;
     else if (strncmp(abspath, "/sys/", 5) != 0 && strcmp(abspath, "/sys") != 0)
 	return path;
 
@@ -194,13 +211,14 @@ trap_path(const char *path)
     return buf;
 }
 
-static dev_t
-get_rdev(const char *nodename)
+static bool
+get_rdev_maj_min(const char *nodename, uint32_t *major, uint32_t *minor)
 {
     static char buf[PATH_MAX];
     static char link[PATH_MAX];
     int name_offset;
-    int major, minor, orig_errno;
+    int orig_errno;
+    libc_func(readlink, ssize_t, const char*, char*, size_t);
 
     name_offset = snprintf(buf, sizeof(buf), "%s/dev/.node/", getenv("UMOCKDEV_DIR"));
     buf[sizeof(buf) - 1] = 0;
@@ -213,18 +231,32 @@ get_rdev(const char *nodename)
 
     /* read major:minor */
     orig_errno = errno;
-    if (readlink(buf, link, sizeof(link)) < 0) {
+    ssize_t link_len = _readlink(buf, link, sizeof(link));
+    if (link_len < 0) {
 	DBG(DBG_PATH, "get_rdev %s: cannot read link %s: %m\n", nodename, buf);
 	errno = orig_errno;
-	return (dev_t) 0;
+	return false;
     }
+    link[link_len] = '\0';
     errno = orig_errno;
-    if (sscanf(link, "%i:%i", &major, &minor) != 2) {
+
+    if (sscanf(link, "%u:%u", major, minor) != 2) {
 	DBG(DBG_PATH, "get_rdev %s: cannot decode major/minor from '%s'\n", nodename, link);
-	return (dev_t) 0;
+	return false;
     }
-    DBG(DBG_PATH, "get_rdev %s: got major/minor %i:%i\n", nodename, major, minor);
-    return makedev(major, minor);
+    DBG(DBG_PATH, "get_rdev %s: got major/minor %u:%u\n", nodename, *major, *minor);
+    return true;
+}
+
+static dev_t
+get_rdev(const char *nodename)
+{
+    unsigned major, minor;
+
+    if (get_rdev_maj_min(nodename, &major, &minor))
+	return makedev(major, minor);
+    else
+	return (dev_t) 0;
 }
 
 static dev_t
@@ -483,9 +515,9 @@ ioctl_emulate_open(int fd, const char *dev_path, int must_exist)
 	}
     }
 
-    fdinfo = malloc(sizeof(struct ioctl_fd_info));
+    fdinfo = mallocx(sizeof(struct ioctl_fd_info));
     fdinfo->ioctl_sock = sock;
-    fdinfo->dev_path = strdup(dev_path);
+    fdinfo->dev_path = strdupx(dev_path);
     fdinfo->is_default = is_default;
     pthread_mutex_init(&fdinfo->sock_lock, NULL);
 
@@ -856,7 +888,7 @@ script_start_record(int fd, const char *logname, const char *recording_path, enu
 	}
     }
 
-    srinfo = malloc(sizeof(struct script_record_info));
+    srinfo = mallocx(sizeof(struct script_record_info));
     srinfo->log = log;
     if (clock_gettime(CLOCK_MONOTONIC, &srinfo->time) < 0) {
 	fprintf(stderr, "libumockdev-preload: failed to clock_gettime: %m\n");
@@ -1163,6 +1195,20 @@ rettype name(const char *path, arg2t arg2, arg3t arg3, arg4t arg4) \
     return r;							\
 }
 
+#define STAT_ADJUST_MODE \
+    if (ret == 0 && p != path && strncmp(path, "/dev/", 5) == 0			\
+	&& is_emulated_device(p, st->st_mode)) {				\
+	st->st_mode &= ~S_IFREG;						\
+	if (st->st_mode & S_ISVTX) {						\
+            st->st_mode = S_IFBLK | (st->st_mode & ~S_IFMT);			\
+	    DBG(DBG_PATH, "  %s is an emulated block device\n", path);		\
+	} else {								\
+            st->st_mode = S_IFCHR | (st->st_mode & ~S_IFMT);			\
+	    DBG(DBG_PATH, "  %s is an emulated char device\n", path);		\
+	}									\
+	st->st_rdev = get_rdev(path + 5);					\
+    }										\
+
 /* wrapper template for stat family; note that we abuse the sticky bit in
  * the emulated /dev to indicate a block device (the sticky bit has no
  * real functionality for device nodes) */
@@ -1181,18 +1227,27 @@ int prefix ## stat ## suffix (const char *path, struct stat ## suffix *st) \
     DBG(DBG_PATH, "testbed wrapped " #prefix "stat" #suffix "(%s) -> %s\n", path, p);	\
     ret = _ ## prefix ## stat ## suffix(p, st);					\
     TRAP_PATH_UNLOCK;								\
-    if (ret == 0 && p != path && strncmp(path, "/dev/", 5) == 0			\
-	&& is_emulated_device(p, st->st_mode)) {				\
-	st->st_mode &= ~S_IFREG;						\
-	if (st->st_mode &  S_ISVTX) {						\
-	    st->st_mode &= ~S_ISVTX; st->st_mode |= S_IFBLK;			\
-	    DBG(DBG_PATH, "  %s is an emulated block device\n", path);		\
-	} else {								\
-	    st->st_mode |= S_IFCHR;						\
-	    DBG(DBG_PATH, "  %s is an emulated char device\n", path);		\
-	}									\
-	st->st_rdev = get_rdev(path + 5);					\
+    STAT_ADJUST_MODE;                                                           \
+    return ret;									\
+}
+
+/* wrapper template for fstatat family */
+#define WRAP_FSTATAT(prefix, suffix) \
+int prefix ## fstatat ## suffix (int dirfd, const char *path, struct stat ## suffix *st, int flags) \
+{ \
+    const char *p;								\
+    libc_func(prefix ## fstatat ## suffix, int, int, const char*, struct stat ## suffix *, int); \
+    int ret;									\
+    TRAP_PATH_LOCK;								\
+    p = trap_path(path);							\
+    if (p == NULL) {								\
+	TRAP_PATH_UNLOCK;							\
+	return -1;								\
     }										\
+    DBG(DBG_PATH, "testbed wrapped " #prefix "fstatat" #suffix "(%s) -> %s\n", path, p); \
+    ret = _ ## prefix ## fstatat ## suffix(dirfd, p, st, flags);		\
+    TRAP_PATH_UNLOCK;								\
+    STAT_ADJUST_MODE;                                                           \
     return ret;									\
 }
 
@@ -1217,20 +1272,30 @@ int prefix ## stat ## suffix (int ver, const char *path, struct stat ## suffix *
     DBG(DBG_PATH, "testbed wrapped " #prefix "stat" #suffix "(%s) -> %s\n", path, p);	\
     ret = _ ## prefix ## stat ## suffix(ver, p, st);				\
     TRAP_PATH_UNLOCK;								\
-    if (ret == 0 && p != path && strncmp(path, "/dev/", 5) == 0			\
-	&& is_emulated_device(p, st->st_mode)) {				\
-	st->st_mode &= ~S_IFREG;						\
-	if (st->st_mode &  S_ISVTX) {						\
-	    st->st_mode &= ~S_ISVTX; st->st_mode |= S_IFBLK;			\
-	    DBG(DBG_PATH, "  %s is an emulated block device\n", path);		\
-	} else {								\
-	    st->st_mode |= S_IFCHR;						\
-	    DBG(DBG_PATH, "  %s is an emulated char device\n", path);		\
-	}									\
-	st->st_rdev = get_rdev(path + 5);					\
-    }										\
+    STAT_ADJUST_MODE;                                                           \
     return ret;									\
 }
+
+/* wrapper template for __fxstatat family */
+#define WRAP_VERFSTATAT(prefix, suffix) \
+int prefix ## fxstatat ## suffix (int ver, int dirfd, const char *path, struct stat ## suffix *st, int flags) \
+{ \
+    const char *p;								\
+    libc_func(prefix ## fxstatat ## suffix, int, int, int, const char*, struct stat ## suffix *, int); \
+    int ret;									\
+    TRAP_PATH_LOCK;								\
+    p = trap_path(path);							\
+    if (p == NULL) {								\
+	TRAP_PATH_UNLOCK;							\
+	return -1;								\
+    }										\
+    DBG(DBG_PATH, "testbed wrapped " #prefix "fxstatat" #suffix "(%s) -> %s\n", path, p); \
+    ret = _ ## prefix ## fxstatat ## suffix(ver, dirfd, p, st, flags);		\
+    TRAP_PATH_UNLOCK;								\
+    STAT_ADJUST_MODE;                                                           \
+    return ret;									\
+}
+
 
 /* wrapper template for open family */
 #define WRAP_OPEN(prefix, suffix) \
@@ -1318,10 +1383,12 @@ WRAP_2ARGS(int, -1, chmod, mode_t);
 WRAP_2ARGS(int, -1, access, int);
 WRAP_STAT(,);
 WRAP_STAT(l,);
+WRAP_FSTATAT(,);
 
 #ifdef __GLIBC__
 WRAP_STAT(,64);
 WRAP_STAT(l,64);
+WRAP_FSTATAT(,64);
 WRAP_FOPEN(,64);
 #endif
 
@@ -1335,6 +1402,118 @@ WRAP_VERSTAT(__x,);
 WRAP_VERSTAT(__x, 64);
 WRAP_VERSTAT(__lx,);
 WRAP_VERSTAT(__lx, 64);
+
+#ifdef HAVE_FXSTATAT
+WRAP_VERFSTATAT(__,);
+WRAP_VERFSTATAT(__,64);
+#endif
+
+int statx(int dirfd, const char *pathname, int flags, unsigned mask, struct statx * stx)
+{
+    const char *p;
+    libc_func(statx, int, int, const char *, int, unsigned, struct statx *);
+    int r;
+
+    TRAP_PATH_LOCK;
+    p = trap_path(pathname);
+    DBG(DBG_PATH, "testbed wrapped statx (%s) -> %s\n", pathname, p ?: "NULL");
+    if (p == NULL)
+        r = -1;
+    else
+        r = _statx(dirfd, p, flags, mask, stx);
+    TRAP_PATH_UNLOCK;
+
+    if (r == 0 && p != pathname && strncmp(pathname, "/dev/", 5) == 0
+            && is_emulated_device(p, stx->stx_mode)) {
+        if (stx->stx_mode & S_ISVTX) {
+            stx->stx_mode = S_IFBLK | (stx->stx_mode & ~S_IFMT);
+            DBG(DBG_PATH, "  %s is an emulated block device (statx)\n", pathname);
+        } else {
+            stx->stx_mode = S_IFCHR | (stx->stx_mode & ~S_IFMT);
+            DBG(DBG_PATH, "  %s is an emulated char device (statx)\n", pathname);
+        }
+	unsigned maj, min;
+	if (get_rdev_maj_min(pathname + 5, &maj, &min)) {
+	    stx->stx_rdev_major = maj;
+	    stx->stx_rdev_minor = min;
+	} else {
+	    stx->stx_rdev_major = stx->stx_rdev_minor = 0;
+	}
+
+    }
+    return r;
+}
+
+static bool is_dir_or_contained(const char *path, const char *dir, const char *subdir)
+{
+    if (!path || !dir)
+	return false;
+
+    const ssize_t subdir_len = strlen(subdir);
+    const size_t dir_len = strlen(dir);
+
+    return (dir_len + subdir_len <= strlen(path) &&
+	    strncmp(path, dir, dir_len) == 0 &&
+	    strncmp(path + dir_len, subdir, subdir_len) == 0 &&
+	    (path[dir_len + subdir_len] == '\0' || path[dir_len + subdir_len] == '/'));
+}
+
+static bool is_fd_in_mock(int fd, const char *subdir)
+{
+    static char fdpath[PATH_MAX];
+    static char linkpath[PATH_MAX];
+    libc_func(readlink, ssize_t, const char*, char *, size_t);
+
+    snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%i", fd);
+    int orig_errno = errno;
+    ssize_t linklen = _readlink(fdpath, linkpath, sizeof linkpath);
+    errno = orig_errno;
+    if (linklen < 0 || linklen >= sizeof linkpath) {
+	perror("umockdev: failed to map fd to a path");
+	return false;
+    }
+    linkpath[linklen] = '\0';
+
+    return is_dir_or_contained(linkpath, getenv("UMOCKDEV_DIR"), subdir);
+}
+
+#define WRAP_FSTATFS(suffix) \
+int fstatfs ## suffix(int fd, struct statfs ## suffix *buf)	\
+{ \
+    libc_func(fstatfs ## suffix, int, int, struct statfs ## suffix *buf); \
+    int r = _fstatfs ## suffix(fd, buf);			\
+    if (r == 0 && is_fd_in_mock (fd, "/sys")) {			\
+	DBG(DBG_PATH, "testbed wrapped fstatfs64 (%i) points into mocked /sys; adjusting f_type\n", fd); \
+	buf->f_type = SYSFS_MAGIC;				\
+    }								\
+    return r;							\
+}
+
+WRAP_FSTATFS();
+WRAP_FSTATFS(64);
+
+#define WRAP_STATFS(suffix) \
+int statfs ## suffix(const char *path, struct statfs ## suffix *buf) {	\
+    libc_func(statfs ## suffix, int, const char*, struct statfs ## suffix *buf); \
+    int r;								\
+    TRAP_PATH_LOCK;							\
+    const char *p = trap_path(path);					\
+    if (p == NULL || p == path) {					\
+	r = _statfs ## suffix(path, buf);				\
+	TRAP_PATH_UNLOCK;						\
+	return r;							\
+    } \
+    DBG(DBG_PATH, "testbed wrapped statfs" #suffix "(%s) -> %s\n", path, p); \
+    r = _statfs ## suffix(p, buf);					\
+    TRAP_PATH_UNLOCK;							\
+    if (r == 0 && is_dir_or_contained(path, "/sys", ""))		\
+	buf->f_type = SYSFS_MAGIC;					\
+    return r;								\
+}
+
+WRAP_STATFS();
+WRAP_STATFS(64);
+
 #endif
 
 int __open_2(const char *path, int flags);
@@ -1423,6 +1602,13 @@ ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
     return r;
 }
 
+/* A readlinkat fortify wrapper that is used when -D_FORTIFY_SOURCE is used. */
+ssize_t __readlinkat_chk(int dirfd, const char *pathname, char *buf, size_t bufsiz, size_t buflen);
+ssize_t __readlinkat_chk(int dirfd, const char *pathname, char *buf, size_t bufsiz, size_t buflen)
+{
+    return readlinkat(dirfd, pathname, buf, bufsiz);
+}
+
 WRAP_2ARGS_PATHRET(char *, NULL, realpath, char *);
 
 char *__realpath_chk(const char *path, char *resolved, size_t size);
@@ -1443,6 +1629,24 @@ getcwd(char *buf, size_t size)
 	size_t prefix_len = strlen (prefix);
 	if (strncmp (r, prefix, prefix_len) == 0) {
 	    DBG(DBG_PATH, "testbed wrapped getcwd: %s -> %s\n", r, r + prefix_len);
+	    memmove(r, r + prefix_len, strlen(r) - prefix_len + 1); \
+	}
+    }
+    return r;
+}
+
+char * __getcwd_chk(char *buf, size_t size, size_t buflen);
+char *
+__getcwd_chk(char *buf, size_t size, size_t buflen)
+{
+    libc_func (__getcwd_chk, char*, char*, size_t, size_t);
+    const char *prefix = getenv("UMOCKDEV_DIR");
+    char *r = ___getcwd_chk (buf, size, buflen);
+
+    if (prefix != NULL && r != NULL) {
+	size_t prefix_len = strlen (prefix);
+	if (strncmp (r, prefix, prefix_len) == 0) {
+	    DBG(DBG_PATH, "testbed wrapped __getcwd_chk: %s -> %s\n", r, r + prefix_len);
 	    memmove(r, r + prefix_len, strlen(r) - prefix_len + 1); \
 	}
     }

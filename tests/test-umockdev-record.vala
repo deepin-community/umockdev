@@ -19,6 +19,7 @@
  * along with this program; If not, see <http://www.gnu.org/licenses/>.
  */
 
+using UMockdevUtils;
 using Assertions;
 
 string readbyte_path;
@@ -106,6 +107,8 @@ t_testbed_one ()
     spawn ("umockdev-record" + " --all", out sout, out serr, out exit);
     assert_cmpstr (serr, CompareOperator.EQ, "");
     assert_cmpint (exit, CompareOperator.EQ, 0);
+    // udevadm 251-rc2 adds this extra synthetic property
+    sout = sout.replace("E: DRIVER=foo\n", "");
     assert_cmpstr (sout, CompareOperator.EQ, """P: /devices/dev1
 E: SIMPLE_PROP=1
 E: SUBSYSTEM=pci
@@ -244,7 +247,7 @@ t_system_invalid ()
     }
 
     spawn ("umockdev-record" + " /sys/class", out sout, out serr, out exit);
-    assert_cmpstr (serr, CompareOperator.EQ, "Invalid device /sys/class, has no uevent attribute\n");
+    assert (serr.contains("Invalid device /sys/class, has no uevent attribute\n"));
     assert_cmpstr (sout, CompareOperator.EQ, "");
     assert_cmpint (exit, CompareOperator.NE, 0);
 
@@ -297,7 +300,7 @@ t_system_ioctl_log ()
     assert (FileUtils.test (log, FileTest.EXISTS));
     assert_cmpstr (file_contents (log), CompareOperator.EQ, "@DEV /dev/zero\n");
 
-    FileUtils.remove (log);
+    checked_remove (log);
 
     // invalid syntax
     spawn ("umockdev-record" + " --ioctl /dev/null -- " + readbyte_path + " /dev/zero",
@@ -340,7 +343,7 @@ t_system_ioctl_log_append_dev_mismatch ()
     // should not change original record
     assert_cmpstr (file_contents (log), CompareOperator.EQ, orig_contents);
 
-    FileUtils.remove (log);
+    checked_remove (log);
 }
 
 /*
@@ -381,7 +384,7 @@ t_system_script_log_simple ()
     assert_cmpint (int.parse(logwords[1]), CompareOperator.LE, 5 * slow_testbed_factor);
     assert_cmpstr (logwords[2], CompareOperator.EQ, "^@");
 
-    FileUtils.remove (log);
+    checked_remove (log);
 }
 
 /*
@@ -424,7 +427,7 @@ t_system_script_log_simple_fopen ()
     assert_cmpint (int.parse(logwords[1]), CompareOperator.LE, 5 * slow_testbed_factor);
     assert_cmpstr (logwords[2], CompareOperator.EQ, "^@");
 
-    FileUtils.remove (log);
+    checked_remove (log);
 }
 
 static void
@@ -470,7 +473,7 @@ t_system_script_log_append_same_dev ()
     assert_cmpint (int.parse(logwords[1]), CompareOperator.LE, 5 * slow_testbed_factor);
     assert_cmpstr (logwords[2], CompareOperator.EQ, "^@");
 
-    FileUtils.remove (log);
+    checked_remove (log);
 }
 
 static void
@@ -502,7 +505,7 @@ t_system_script_log_append_dev_mismatch ()
     // should not change original record
     assert_cmpstr (file_contents (log), CompareOperator.EQ, orig_contents);
 
-    FileUtils.remove (log);
+    checked_remove (log);
 }
 
 static string
@@ -624,7 +627,7 @@ t_system_script_log_chatter ()
     // verify EOF
     assert_cmpint (log_stream.scanf ("%*c"), CompareOperator.EQ, -1);
 
-    FileUtils.remove (log);
+    checked_remove (log);
 }
 
 /*
@@ -703,10 +706,10 @@ t_system_script_log_chatter_socket_stream ()
         Thread.usleep (20000);
         conn.send ("recv()".data);
     } catch (Error e) {
-        FileUtils.remove (spath);
+        checked_remove (spath);
         error ("Error: %s", e.message);
     }
-    FileUtils.remove (spath);
+    checked_remove (spath);
 
     int status;
     assert_cmpint ((int) Posix.waitpid (chatter_pid, out status, 0), CompareOperator.EQ, (int) chatter_pid);
@@ -728,7 +731,7 @@ t_system_script_log_chatter_socket_stream ()
     assert_cmpint (time, CompareOperator.GE, 20);
     assert_cmpint (time, CompareOperator.LE, 60 * slow_testbed_factor);
 
-    FileUtils.remove (log);
+    checked_remove (log);
 }
 
 /*
@@ -779,7 +782,7 @@ t_system_evemu_log ()
     // unchanged
     assert_cmpstr (file_contents (log), CompareOperator.EQ, "# EVEMU 1.2\n# device /dev/null\n\n");
 
-    FileUtils.remove (log);
+    checked_remove (log);
 
     // invalid syntax
     spawn ("umockdev-record" + " --evemu-events /dev/null -- true",
@@ -865,8 +868,8 @@ t_gphoto2_record ()
     assert_cmpint (exit, CompareOperator.EQ, 0);
     assert_cmpstr (sout, CompareOperator.EQ, sout_record);
 
-    FileUtils.remove ("gphoto-test.umockdev");
-    FileUtils.remove ("gphoto-test.ioctl");
+    checked_remove ("gphoto-test.umockdev");
+    checked_remove ("gphoto-test.ioctl");
 }
 
 int

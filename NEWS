@@ -1,3 +1,56 @@
+OBSOLETE: Release news of newer versions are contained in the tag descriptions.
+
+## [0.17.13] - 2022-05-30
+- preload: Wrap fstatfs(), to work with systemd 251 also with Python tests
+- Fix tests in Gentoo sandbox build
+
+## [0.17.12] - 2022-05-19
+- Work around packit propose_downstream bug
+
+## [0.17.11] - 2022-05-19
+- Fix documentation build (thanks Benjamin Berg)
+
+## [0.17.10] - 2022-05-10
+- Adjust to systemd 251-rc2: Set $SYSTEMD_DEVICE_VERIFY_SYSFS, parse new udevadm format, update tests
+
+## [0.17.9] - 2022-04-10
+- preload: Wrap fortified version of readlinkat (thanks Martin Liska)
+
+## [0.17.8] - 2022-03-23
+- Fix some potential crashes spotted by Coverity
+- Enable Fedora builds and bodhi updates via packit
+
+## [0.17.7] - 2022-03-01
+- Fix uevent race condition in umockdev_testbed_add_from_string()
+
+## [0.17.6] - 2022-01-21
+- Increase uevent buffer size (#167)
+- Skip /umockdev-testbed-vala/detects_running_outside_testbed during normal
+  builds for the time being, as it is brittle on several architectures (#169)
+
+## [0.17.5] - 2022-01-18
+- Relax overzealous stat nlink unit test
+
+## [0.17.4] - 2022-01-18
+- Include udev properties in emulated netlink messages, to work with recent
+  libudev (#165)
+
+## [0.17.3] - 2022-01-11
+- tests: Work around broken HIDIOCGRDESCSIZE ioctl on big-endian architectures
+
+## [0.17.2] - 2022-01-10
+- preload: Wrap statx() and fstatat(), to fix `ls` and other tools on
+  recent glibc versions. (#160)
+
+## [0.17.1] - 2021-12-14
+- Fix /sys/dev/* symlinks; regression from 0.15.3 (#155)
+
+## [0.17.0] - 2021-12-11
+- Add ioctls necessary to record/replay hidraw devices (thanks Daiki Ueno)
+- meson: Respect includedir option (thanks Florentin Dubois)
+- tests: Fix for Fedora koji emulated architectures s390x and arm
+- Enable automatic Fedora package updates with packit
+
 ## [0.16.3] - 2021-09-15
 - Several pcap replay fixes (thanks Benjamin Berg)
 - Immediately create "bus" and "class" directories in /sys to fix udev enumerator
@@ -501,7 +554,7 @@ version 0.1.
 - Fix building with automake 1.11.3 and Vala 0.16.
 - Generalize ioctl recording and emulation for ioctls with simple structs, i.
   e. no pointer fields. This makes it much easier to add more ioctls in the
-  future. 
+  future.
 - Store return values of ioctls in records, as they are not always 0
   (like EVIOCGBIT)
 - Add support for ioctl ranges (like EVIOCGABS) and ioctls with variable length

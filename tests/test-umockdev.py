@@ -18,20 +18,29 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program; If not, see <http://www.gnu.org/licenses/>.
 
-import sys
+import fcntl
 import os.path
+import struct
+import sys
 import unittest
+import warnings
 
 try:
     import gi
     gi.require_version('GUdev', '1.0')
     gi.require_version('UMockdev', '1.0')
-    from gi.repository import GLib, GUdev
+    # 'pkgutil.get_loader' is deprecated and slated for removal in Python 3.14
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=DeprecationWarning)
+        from gi.repository import GLib, GUdev
 except ImportError as e:
     print('GI module not available, skipping test: %s' % e)
     sys.exit(0)
 
-from gi.repository import UMockdev
+with warnings.catch_warnings():
+    warnings.filterwarnings('ignore', category=DeprecationWarning)
+    from gi.repository import UMockdev
+
 
 class Testbed(unittest.TestCase):
     def setUp(self):
@@ -129,7 +138,7 @@ class Testbed(unittest.TestCase):
     def test_uevent(self):
         '''testbed uevent()'''
 
-        counter = [0, 0, 0, None]  # add, remove, change, last device
+        counter = [0, 0, 0, None, None, None]  # add, remove, change, last device, idVendor, ID_INPUT
 
         def on_uevent(client, action, device, counters):
             if action == 'add':
@@ -138,9 +147,13 @@ class Testbed(unittest.TestCase):
                 counters[1] += 1
             else:
                 assert action == 'change'
+                self.assertEqual(device.get_sysfs_attr('idVendor'), '0815')
+                self.assertEqual(device.get_property('ID_INPUT'), '1')
                 counters[2] += 1
 
             counters[3] = device.get_sysfs_path()
+            counters[4] = device.get_sysfs_attr('idVendor')
+            counters[5] = device.get_property('ID_INPUT')
 
         syspath = self.testbed.add_device('pci', 'mydev', None, ['idVendor', '0815'], ['ID_INPUT', '1'])
         self.assertNotEqual(syspath, None)
@@ -155,17 +168,20 @@ class Testbed(unittest.TestCase):
         self.testbed.uevent(syspath, 'add')
         GLib.timeout_add(500, mainloop.quit)
         mainloop.run()
-        self.assertEqual(counter, [1, 0, 0, syspath])
+        self.assertEqual(counter, [1, 0, 0, syspath, '0815', '1'])
 
         counter[0] = 0
         counter[3] = None
+        counter[4] = None
+        counter[5] = None
+
         self.testbed.uevent(syspath, 'change')
         GLib.timeout_add(500, mainloop.quit)
         mainloop.run()
-        self.assertEqual(counter, [0, 0, 1, syspath])
+        self.assertEqual(counter, [0, 0, 1, syspath, '0815', '1'])
 
     def test_add_from_string(self):
-        self.assertTrue(self.testbed.add_from_string ('''P: /devices/dev1
+        self.assertTrue(self.testbed.add_from_string('''P: /devices/dev1
 E: SIMPLE_PROP=1
 E: SUBSYSTEM=pci
 H: binary_attr=41FF0005FF00
@@ -178,13 +194,13 @@ A: simple_attr=1
         devices = enum.execute()
         self.assertEqual([d.get_sysfs_path() for d in devices], ['/sys/devices/dev1'])
 
-        device = client.query_by_sysfs_path ('/sys/devices/dev1')
-        self.assertEqual (device.get_subsystem(), 'pci')
-        #self.assertEqual (device.get_parent(), None)
-        self.assertEqual (device.get_sysfs_attr('simple_attr'), '1')
-        self.assertEqual (device.get_sysfs_attr('multiline_attr'),
-                          'a\\b\nc\\d\nlast')
-        self.assertEqual (device.get_property('SIMPLE_PROP'), '1')
+        device = client.query_by_sysfs_path('/sys/devices/dev1')
+        self.assertEqual(device.get_subsystem(), 'pci')
+        # self.assertEqual(device.get_parent(), None)
+        self.assertEqual(device.get_sysfs_attr('simple_attr'), '1')
+        self.assertEqual(device.get_sysfs_attr('multiline_attr'),
+                         'a\\b\nc\\d\nlast')
+        self.assertEqual(device.get_property('SIMPLE_PROP'), '1')
         with open(os.path.join(self.testbed.get_root_dir(),
                                '/sys/devices/dev1/binary_attr'), 'rb') as f:
             self.assertEqual(f.read(), b'\x41\xFF\x00\x05\xFF\x00')
@@ -198,11 +214,45 @@ A: simple_attr=1
             assertRaisesRegex = self.assertRaisesRegexp
 
         # does not start with P:
-        with assertRaisesRegex(GLib.GError, 'must start with.*P:') as cm:
-            self.testbed.add_from_string ('E: SIMPLE_PROP=1\n')
+        with assertRaisesRegex(GLib.GError, 'must start with.*P:'):
+            self.testbed.add_from_string('E: SIMPLE_PROP=1\n')
 
         # no value
-        with assertRaisesRegex(GLib.GError, 'malformed attribute') as cm:
-            self.testbed.add_from_string ('P: /devices/dev1\nE: SIMPLE_PROP\n')
+        with assertRaisesRegex(GLib.GError, 'malformed attribute'):
+            self.testbed.add_from_string('P: /devices/dev1\nE: SIMPLE_PROP\n')
+
+    def test_custom_ioctl(self):
+        handler = UMockdev.IoctlBase()
+
+        def handle_ioctl(handler, client):
+            if client.get_request() != 1:
+                return False
+
+            in_data = struct.pack('l', -1)
+            out_data = struct.pack('l', 1)
+            arg = client.get_arg()
+            data = arg.resolve(0, len(out_data))
+            if data.retrieve() != in_data:
+                return False
+            data.update(0, out_data)
+
+            client.complete(99, 0)
+            return True
+
+        handler.connect("handle-ioctl", handle_ioctl)
+
+        self.testbed.add_from_string('P: /devices/test\nN: test\nE: SUBSYSTEM=test')
+        self.testbed.attach_ioctl('/dev/test', handler)
+
+        fd = os.open('/dev/test', os.O_RDONLY)
+        arg = bytearray(struct.pack('l', -1))
+        self.assertEqual(fcntl.ioctl(fd, 1, arg, True), 99)
+        arg = struct.unpack('l', arg)[0]
+        self.assertEqual(arg, 1)
+
+        # Check that an detach/attach works
+        self.testbed.detach_ioctl('/dev/test')
+        self.testbed.attach_ioctl('/dev/test', handler)
+
 
 unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout, verbosity=2))

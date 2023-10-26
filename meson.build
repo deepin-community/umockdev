@@ -1,5 +1,5 @@
 project('umockdev', 'c', 'vala',
-  version: run_command('sed', '-rn', '1 { s/^.*\[([0-9.]+)\].*/\\1/; p }', 'NEWS').stdout().strip(),
+  version: run_command(meson.current_source_dir() / 'src' / 'getversion.sh', check: true).stdout().strip(),
   license: 'LGPLv2.1+')
 
 srcdir = meson.current_source_dir() / 'src'
@@ -7,11 +7,15 @@ testsdir = meson.current_source_dir() / 'tests'
 lib_version = '0.3.0'
 
 add_project_arguments(
+  '-std=gnu11',
   '-Werror=missing-prototypes',
   '-Werror=strict-prototypes',
   '-Werror=nested-externs',
   '-Werror=pointer-arith',
   '-Werror=implicit-function-declaration',
+  '-Werror=implicit-int',
+  '-Werror=int-conversion',
+  '-Werror=old-style-definition',
   '-Werror=pointer-arith',
   '-Werror=init-self',
   '-Werror=format-security',
@@ -22,7 +26,11 @@ add_project_arguments(
   '-Werror=uninitialized',
   # experimental: first check this on all Debian architectures
   '-Wcast-align',
+  # older gcc versions don't know about all the -Wanalyzer errors which we want to quiesce
+  '-Wno-error=pragmas',
   language: 'c')
+
+add_project_arguments('--abi-stability', language: 'vala')
 
 # let's not clutter the code with too many #ifdefs
 if get_option('b_ndebug') == 'true'
@@ -34,8 +42,20 @@ cc = meson.get_compiler('c')
 valac = meson.get_compiler('vala')
 g_ir_compiler = find_program('g-ir-compiler', required: false)
 
+# HACK: vala doesn't support declaring const arguments, so we get a lot of errors
+if cc.get_id() == 'clang'
+  add_project_arguments('-Wno-incompatible-function-pointer-types', language: 'c')
+endif
+
 conf.set('PACKAGE_NAME', meson.project_name())
 conf.set_quoted('VERSION', meson.project_version())
+
+# glibc versions somewhere between 2.28 and 2.34
+if cc.has_function('__fxstatat', prefix: '#include <sys/stat.h>')
+  add_project_arguments('-DHAVE_FXSTATAT', language: 'c')
+endif
+
+meson.add_dist_script(srcdir / 'getversion.sh')
 
 #
 # dependencies
@@ -86,6 +106,7 @@ endif
 preload_lib = shared_library('umockdev-preload',
   ['src/libumockdev-preload.c',
    'src/debug.c',
+   'src/utils.c',
    'src/ioctl_tree.c'],
   c_args: ['-fvisibility=default'],
   version: '0.0.0',
@@ -111,6 +132,7 @@ umockdev_lib = shared_library('umockdev',
    'src/uevent_sender.c',
    'src/ioctl_tree.vapi',
    'src/ioctl_tree.c',
+   'src/utils.c',
    'src/debug.c'],
   vala_vapi: 'umockdev-1.0.vapi',
   vala_gir: 'UMockdev-1.0.gir',
@@ -128,7 +150,7 @@ umockdev_lib = shared_library('umockdev',
   include_directories: include_directories('src'),
   version: lib_version,
   install: true,
-  install_dir: [true, 'include/umockdev-1.0', true, true])
+  install_dir: [true, get_option('includedir') / 'umockdev-1.0', true, true])
 
 # no way to insert "Rename to:" into annotations, so hack it
 hacked_gir = custom_target('UMockdev-1.0 hacked gir',
@@ -172,6 +194,7 @@ umockdev_record_exe = executable('umockdev-record',
    'src/umockdev-spi.vala',
    'src/ioctl_tree.vapi',
    'src/ioctl_tree.c',
+   'src/utils.c',
    'src/debug.c'],
   dependencies: [glib, gobject, gio_unix, vapi_posix, vapi_config, vapi_ioctl, libpcap],
   link_with: [umockdev_utils_lib],
@@ -230,7 +253,7 @@ if gudev.found()
   test('umockdev-vala', executable('test-umockdev-vala',
       'tests/test-umockdev-vala.vala',
       dependencies: [glib, gobject, gio, gudev, vapi_posix, vapi_assertions, vapi_ioctl],
-      link_with: [umockdev_lib]),
+      link_with: [umockdev_lib, umockdev_utils_lib]),
     depends: [preload_lib],
     suite: 'fails-valgrind')
 endif
@@ -238,6 +261,7 @@ endif
 test('ioctl-tree', executable('test-ioctl-tree',
   ['tests/test-ioctl-tree.c',
    'src/ioctl_tree.c',
+   'src/utils.c',
    'src/debug.c'],
   include_directories: include_directories('src'),
   dependencies: [glib]))
@@ -245,13 +269,13 @@ test('ioctl-tree', executable('test-ioctl-tree',
 test('umockdev-run', executable('test-umockdev-run',
     'tests/test-umockdev-run.vala',
     dependencies: [glib, gobject, gio, vapi_posix, vapi_assertions, vapi_config],
-    link_with: [umockdev_lib]),
+    link_with: [umockdev_lib, umockdev_utils_lib]),
   depends: [umockdev_run_exe, preload_lib, test_chatter_exe, test_chatter_stream_exe])
 
 test('umockdev-record', executable('test-umockdev-record',
     'tests/test-umockdev-record.vala',
     dependencies: [glib, gobject, gio, gio_unix, vapi_posix, vapi_linux, vapi_assertions, vapi_config, vala_libutil],
-    link_with: [umockdev_lib]),
+    link_with: [umockdev_lib, umockdev_utils_lib]),
   depends: [umockdev_record_exe, preload_lib, test_readbyte_exe, test_chatter_exe, test_chatter_stream_exe],
   suite: 'fails-valgrind')
 

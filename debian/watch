@@ -1,2 +1,5 @@
 version=4
-https://github.com/martinpitt/umockdev/releases/ .*/umockdev-([\d\.]+)\.tar\.xz
+opts="searchmode=plain, \
+filenamemangle=s/.+\/@PACKAGE@-@ANY_VERSION@.tar.gz/@PACKAGE@-$1\.tar\.xz/" \
+https://api.github.com/repos/martinpitt/@PACKAGE@/releases \
+https://github.com/martinpitt/@PACKAGE@/releases/download/\d[\.\d]*/@PACKAGE@-@ANY_VERSION@.tar.xz

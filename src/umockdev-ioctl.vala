@@ -43,7 +43,7 @@ internal bool signal_accumulator_true_handled(GLib.SignalInvocationHint ihint,
  *
  * Since: 0.16
  */
-public class IoctlData {
+public class IoctlData : GLib.Object {
     /* Local cache to check if data is dirty before flushing. This is both an
      * optimization as it avoids flushes, but is also necessary to avoid
      * writing into read-only memory.
@@ -66,6 +66,30 @@ public class IoctlData {
     }
 
     /**
+     * umockdev_ioctl_data_ref:
+     * @self: A #UMockdevIoctlData
+     *
+     * Deprecated, same as g_object_ref().
+     */
+    [CCode(cname="umockdev_ioctl_data_ref")]
+    public new IoctlData? compat_ref()
+    {
+        return (IoctlData?) this;
+    }
+
+    /**
+     * umockdev_ioctl_data_unref:
+     * @self: A #UMockdevIoctlData
+     *
+     * Deprecated, same as g_object_unref().
+     */
+    [CCode(cname="umockdev_ioctl_data_unref")]
+    public new void compat_unref()
+    {
+        this.unref();
+    }
+
+    /**
      * umockdev_ioctl_data_resolve:
      * @self: A #UMockdevIoctlData
      * @offset: Byte offset of pointer inside data
@@ -80,7 +104,7 @@ public class IoctlData {
      * You may call this multiple times on the same pointer in order to fetch
      * the existing information.
      *
-     * Returns: #IoctlData, or #NULL on error
+     * Returns: #UMockdevIoctlData, or #NULL on error
      * Since: 0.16
      */
     public IoctlData? resolve(size_t offset, size_t len) throws IOError {
@@ -149,7 +173,7 @@ public class IoctlData {
 
     /**
      * umockdev_ioctl_data_reload:
-     * @self: A #UmockdevIoctlData
+     * @self: A #UMockdevIoctlData
      * @error: return location for a GError, or %NULL
      *
      * This function allows reloading the data from the client side in case
@@ -158,8 +182,8 @@ public class IoctlData {
      * It is very unlikely that such an explicit reload is needed.
      *
      * Doing this unresolves any resolved pointers. Take care to re-resolve
-     * them and use the newly resolved #IoctlData in case you need to access
-     * the data.
+     * them and use the newly resolved #UMockdevIoctlData in case you need to
+     * access the data.
      *
      * Returns: #TRUE on success, #FALSE otherwise
      * Since: 0.16
@@ -171,6 +195,42 @@ public class IoctlData {
         children_offset.resize(0);
 
         return true;
+    }
+
+    /**
+     * umockdev_ioctl_update:
+     * @self: A #UMockdevIoctlData
+     * @offset: Offset into data
+     * @new_data: (array length=length): Data to set
+     * @new_data_length1: Lenght of binary data, must be smaller or equal to actual length
+     *
+     * Set data to a specific value. This is essentially a memcpy call, it is
+     * only useful for e.g. python where the bindings cannot make the data
+     * writable otherwise.
+     *
+     * Since: 0.18
+     */
+    public void update(size_t offset, uint8[] new_data) {
+        assert(offset + new_data.length <= data.length);
+
+        Posix.memcpy(&data[offset], new_data, new_data.length);
+    }
+
+    /**
+     * umockdev_ioctl_retrieve:
+     * @self: A #UMockdevIoctlData
+     * @read_data: (array length=length) (out): Data to set
+     * @read_data_length1: (out): Lenght of binary data, must be smaller or equal to actual length
+     *
+     * Simply returns the data struct member. This function purely exists for
+     * GIR based bindings, as the vala generated bindings do not correctly
+     * tag the array length, and direct access to the struct member is not
+     * possible.
+     *
+     * Since: 0.18
+     */
+    public void retrieve(out uint8[] read_data) {
+        read_data = data;
     }
 
     internal void load_data() throws IOError {
@@ -615,7 +675,7 @@ public class IoctlClient : GLib.Object {
  *
  * Called when an ioctl is requested by the client.
  *
- * Access the #UMockdevIoctlClient::arg property of @client to retrieve the
+ * Access the #UMockdevIoctlClient:arg property of @client to retrieve the
  * argument of the ioctl. This is a pointer sized buffer initially with the
  * original argument passed to the ioctl. If this is pointing to a struct, use
  * umockdev_ioctl_data_resolve() to retrieve the underlying memory and update
@@ -645,7 +705,7 @@ public class IoctlClient : GLib.Object {
  *
  * Called when a read is requested by the client.
  *
- * The result buffer is represented by #UMockdevIoctlClient::arg of @client.
+ * The result buffer is represented by #UMockdevIoctlClient:arg of @client.
  * Retrieve its length to find out the requested read length. The content of
  * the buffer has already been retrieved, and you can freely use and update it.
  *
@@ -661,7 +721,7 @@ public class IoctlClient : GLib.Object {
  *
  * Called when a write is requested by the client.
  *
- * The written buffer is represented by #UMockdevIoctlClient::arg of @client.
+ * The written buffer is represented by #UMockdevIoctlClient:arg of @client.
  * Retrieve its length to find out the requested write length. The content of
  * the buffer has already been retrieved, and you can freely use it.
  *
@@ -737,8 +797,7 @@ public class IoctlBase: GLib.Object {
                 error("Could not accept new connection: %s", e.message);
         }
 
-        lock (listeners)
-          listeners.remove(devnode);
+        listener.close();
     }
 
 #if INTERNAL_REGISTER_API
@@ -747,6 +806,8 @@ public class IoctlBase: GLib.Object {
         assert(DirUtils.create_with_parents(Path.get_dirname(sockpath), 0755) == 0);
 
         Cancellable cancellable = new Cancellable();
+
+        cancellable.set_data("sockpath", sockpath);
 
         /* We create new listener for each file; purely because we may not
          * have the correct main context in construct yet. */
@@ -772,8 +833,11 @@ public class IoctlBase: GLib.Object {
 #if INTERNAL_UNREGISTER_PATH_API
     internal void unregister_path(string devnode)
     {
-        lock (listeners)
-          listeners[devnode].cancel();
+        lock (listeners) {
+            listeners[devnode].cancel();
+            Posix.unlink(listeners[devnode].get_data("sockpath"));
+            listeners.remove(devnode);
+        }
     }
 #endif
 
@@ -781,20 +845,16 @@ public class IoctlBase: GLib.Object {
     internal void unregister_all()
     {
         lock (listeners) {
-            listeners.foreach((key, val) => {
+            listeners.foreach_remove((key, val) => {
                 val.cancel();
+                Posix.unlink(val.get_data("sockpath"));
+                return true;
             });
         }
     }
 #endif
 
 #endif // INTERNAL_REGISTER_API
-
-    public virtual signal void client_connected(IoctlClient client) {
-    }
-
-    public virtual signal void client_vanished(IoctlClient client) {
-    }
 
     /* Not a normal signal because we need the accumulator. */
     public virtual bool handle_ioctl(IoctlClient client) {
@@ -807,6 +867,12 @@ public class IoctlBase: GLib.Object {
 
     public virtual bool handle_write(IoctlClient client) {
         return false;
+    }
+
+    public virtual signal void client_connected(IoctlClient client) {
+    }
+
+    public virtual signal void client_vanished(IoctlClient client) {
     }
 }
 
@@ -938,6 +1004,8 @@ internal class IoctlTreeRecorder : IoctlBase {
         /* Only write log file if we ever saw a client. */
         if (!write_log)
             return;
+
+        assert (device != null);
 
         log = Posix.FILE.open(logfile, "w+");
         log.printf("@DEV %s\n", device);
