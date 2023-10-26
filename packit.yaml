@@ -1,0 +1,58 @@
+# See the documentation for more information:
+# https://packit.dev/docs/configuration/
+upstream_project_url: https://github.com/martinpitt/umockdev
+issue_repository: https://github.com/martinpitt/umockdev
+copy_upstream_release_description: true
+upstream_package_name: umockdev
+downstream_package_name: umockdev
+# HACK: should be implied, but fails propose_downstream: https://github.com/packit/packit-service/issues/1511
+specfile_path: packaging/umockdev.spec
+
+actions:
+  create-archive:
+    - meson tmp/dist
+    # ignore local spec changes from packit
+    - meson dist -C tmp/dist --no-tests --allow-dirty
+    - sh -ec 'mv tmp/dist/meson-dist/umockdev-*.tar.xz packaging/; ls packaging/umockdev-*.tar.xz'
+
+srpm_build_deps:
+  - meson
+  - gcc
+  - vala
+  - libpcap-devel
+  - glib2-devel
+  - systemd-devel
+
+jobs:
+  - job: copr_build
+    trigger: pull_request
+    targets:
+      - fedora-development-x86_64
+      - fedora-development-i386
+      - fedora-development-aarch64
+      - fedora-development-ppc64le
+      - fedora-development-s390x
+      - fedora-development-armhfp
+
+  - job: tests
+    trigger: pull_request
+    targets:
+      - fedora-latest
+      - centos-stream-9-x86_64
+
+  - job: propose_downstream
+    trigger: release
+    dist_git_branches:
+      - fedora-development
+      - fedora-stable
+
+  - job: koji_build
+    trigger: commit
+    dist_git_branches:
+      - fedora-all
+
+  - job: bodhi_update
+    trigger: commit
+    dist_git_branches:
+      # rawhide updates are created automatically
+      - fedora-branched

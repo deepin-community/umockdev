@@ -18,9 +18,11 @@
  * along with this program; If not, see <http://www.gnu.org/licenses/>.
  */
 
+using UMockdevUtils;
 using Assertions;
 
 const string umockdev_run_command = "env LC_ALL=C umockdev-run ";
+const string umockdev_record_command = "env LC_ALL=C umockdev-record ";
 
 string rootdir;
 string tests_dir;
@@ -53,18 +55,6 @@ assert_in (string needle, string haystack)
     if (!haystack.contains (needle)) {
         error ("'%s' not found in '%s'", needle, haystack);
     }
-}
-
-static bool
-skip_brittle_test (string reason)
-{
-    if (Environment.get_variable ("BRITTLE_TESTS") == null) {
-        stdout.printf ("[SKIP: brittle test: %s] ", reason);
-        stdout.flush ();
-        return true;
-    }
-
-    return false;
 }
 
 static bool
@@ -113,8 +103,8 @@ check_program_out (string program, string run_command, string expected_out)
     if (!get_program_out (program, umockdev_run_command + run_command, out sout, out serr, out exit))
         return;
 
-    assert_cmpstr (sout, CompareOperator.EQ, expected_out);
     assert_cmpstr (serr, CompareOperator.EQ, "");
+    assert_cmpstr (sout, CompareOperator.EQ, expected_out);
     assert_cmpint (exit, CompareOperator.EQ, 0);
 }
 
@@ -131,7 +121,6 @@ check_program_error (string program, string run_command, string expected_err)
     assert_in (expected_err, serr);
 
     assert_cmpint (exit, CompareOperator.NE, 0);
-    assert (Process.if_exited (exit));
     assert_cmpstr (sout, CompareOperator.EQ, "");
 }
 
@@ -142,7 +131,7 @@ t_run_exit_code ()
     int exit;
 
     // normal exit, zero
-    check_program_out ("true", umockdev_run_command + "true", "");
+    check_program_out ("true", "true", "");
 
     // normal exit, nonzero
     get_program_out ("ls", umockdev_run_command + "ls /nonexisting", out sout, out serr, out exit);
@@ -156,7 +145,6 @@ t_run_exit_code ()
     assert (Process.if_signaled (exit));
     assert_cmpint (Process.term_sig (exit), CompareOperator.EQ, ProcessSignal.SEGV);
     assert_cmpstr (sout, CompareOperator.EQ, "");
-    assert_cmpstr (serr, CompareOperator.EQ, "");
 }
 
 static void
@@ -180,6 +168,46 @@ t_run_pipes ()
     assert_cmpstr (sout, CompareOperator.EQ, "hello\n");
     assert_cmpstr (serr, CompareOperator.EQ, "");
     assert_cmpint (exit, CompareOperator.EQ, 0);
+}
+
+static void
+t_run_udevadm_block ()
+{
+    string umockdev_file;
+
+    Posix.close (checked_open_tmp ("loop23.XXXXXX.umockdev", out umockdev_file));
+
+    checked_file_set_contents (umockdev_file, """P: /devices/virtual/block/loop23
+N: loop23
+E: DEVNAME=/dev/loop23
+E: DEVTYPE=disk
+E: MAJOR=7
+E: MINOR=23
+E: SUBSYSTEM=block
+A: dev=7:23\n
+A: size=1048576\n
+""");
+
+    string sout;
+    string serr;
+    int exit;
+
+    // unfortunately the udevadm output between distros is not entirely constant
+    assert (get_program_out (
+            "udevadm",
+            umockdev_run_command + "-d " + umockdev_file + " -- udevadm info --query=all --name=/dev/loop23",
+            out sout, out serr, out exit));
+
+    assert_cmpstr (serr, CompareOperator.EQ, "");
+    assert_cmpint (exit, CompareOperator.EQ, 0);
+    assert (sout.contains ("P: /devices/virtual/block/loop23\n"));
+    assert (sout.contains ("P: /devices/virtual/block/loop23\n"));
+    assert (sout.contains ("E: DEVPATH=/devices/virtual/block/loop23"));
+    assert (sout.contains ("E: DEVNAME=/dev/loop23"));
+    assert (sout.contains ("E: MAJOR=7"));
+    assert (sout.contains ("E: MINOR=23"));
+
+    checked_remove (umockdev_file);
 }
 
 static void
@@ -276,6 +304,39 @@ t_run_invalid_program ()
 }
 
 static void
+t_run_record_null ()
+{
+    string umockdev_file;
+    string sout;
+    string serr;
+    int exit;
+
+    if (!FileUtils.test("/sys/dev/char/1:3", FileTest.EXISTS)) {
+        stdout.printf ("[SKIP: no real /sys on this system] ");
+        stdout.flush ();
+        return;
+    }
+
+    // stat or other programs segfault under Gentoo's sandbox in umockdev
+    if (Environ.get_variable(Environ.get(), "SANDBOX_ON") == "1") {
+        stdout.printf ("[SKIP: crashes in Gentoo's sandbox] ");
+        stdout.flush ();
+        return;
+    }
+
+    Posix.close (checked_open_tmp ("null.XXXXXX.umockdev", out umockdev_file));
+    assert (get_program_out ("true", umockdev_record_command + "/dev/null", out sout, out serr, out exit));
+    assert_cmpstr (serr, CompareOperator.EQ, "");
+    assert_cmpint (exit, CompareOperator.EQ, 0);
+    checked_file_set_contents (umockdev_file, sout);
+
+    check_program_out("true", "-d " + umockdev_file + " -- stat -c '%n %F %t %T' /dev/null",
+                      "/dev/null character special file 1 3\n");
+
+    checked_remove (umockdev_file);
+}
+
+static void
 t_run_script_chatter ()
 {
     string umockdev_file, script_file;
@@ -300,8 +361,8 @@ w 0 bye!^J""");
                        " -- " + tests_dir + "/chatter /dev/ttyS0",
                        "Got input: Joe Tester\nGot input: somejunk\n");
 
-    FileUtils.remove (umockdev_file);
-    FileUtils.remove (script_file);
+    checked_remove (umockdev_file);
+    checked_remove (script_file);
 }
 
 static void
@@ -322,7 +383,7 @@ r 30 somejunk""");
                        " -- " + tests_dir + "/chatter-socket-stream /dev/socket/chatter",
                        "Got name: Joe Tester\n\nGot recv: somejunk\n");
 
-    FileUtils.remove (script_file);
+    checked_remove (script_file);
 }
 
 static void
@@ -336,6 +397,9 @@ t_gphoto_detect ()
 Canon PowerShot SX200 IS       usb:001,011     
 """);
 }
+
+/*
+   broken: URB structure apparently got more flexible a while ago; triggers assertion about submit_node != NULL
 
 static bool
 check_gphoto_version ()
@@ -364,9 +428,6 @@ t_gphoto_folderlist ()
     if (!check_gphoto_version ())
         return;
 
-    if (skip_brittle_test ("URB structure apparently got more flexible; triggers assertion about submit_node != NULL"))
-        return;
-
     check_program_out ("gphoto2",
         "-d " + rootdir + "/devices/cameras/canon-powershot-sx200.umockdev -i /dev/bus/usb/001/011=" +
             rootdir + "/devices/cameras/canon-powershot-sx200.ioctl -- gphoto2 -l",
@@ -384,9 +445,6 @@ static void
 t_gphoto_filelist ()
 {
     if (!check_gphoto_version ())
-        return;
-
-    if (skip_brittle_test ("URB structure apparently got more flexible; triggers assertion about submit_node != NULL"))
         return;
 
     check_program_out ("gphoto2",
@@ -411,9 +469,6 @@ t_gphoto_thumbs ()
     if (!check_gphoto_version ())
         return;
 
-    if (skip_brittle_test ("URB structure apparently got more flexible; triggers assertion about submit_node != NULL"))
-        return;
-
     get_program_out ("gphoto2", umockdev_run_command + "-d " + rootdir +
             "/devices/cameras/canon-powershot-sx200.umockdev -i /dev/bus/usb/001/011=" +
             rootdir + "/devices/cameras/canon-powershot-sx200.ioctl -- gphoto2 -T",
@@ -429,8 +484,8 @@ t_gphoto_thumbs ()
     assert (Posix.stat("thumb_IMG_0002.jpg", out st) == 0);
     assert_cmpuint ((uint) st.st_size, CompareOperator.GT, 500);
 
-    FileUtils.remove ("thumb_IMG_0001.jpg");
-    FileUtils.remove ("thumb_IMG_0002.jpg");
+    checked_remove ("thumb_IMG_0001.jpg");
+    checked_remove ("thumb_IMG_0002.jpg");
 }
 static void
 t_gphoto_download ()
@@ -440,9 +495,6 @@ t_gphoto_download ()
     int exit;
 
     if (!check_gphoto_version ())
-        return;
-
-    if (skip_brittle_test ("URB structure apparently got more flexible; triggers assertion about submit_node != NULL"))
         return;
 
     get_program_out ("gphoto2", umockdev_run_command + "-d " + rootdir +
@@ -460,9 +512,11 @@ t_gphoto_download ()
     assert (Posix.stat("IMG_0002.JPG", out st) == 0);
     assert_cmpuint ((uint) st.st_size, CompareOperator.GT, 5000);
 
-    FileUtils.remove ("IMG_0001.JPG");
-    FileUtils.remove ("IMG_0002.JPG");
+    checked_remove ("IMG_0001.JPG");
+    checked_remove ("IMG_0002.JPG");
 }
+
+*/
 
 static void
 t_input_touchpad ()
@@ -517,17 +571,30 @@ t_input_touchpad ()
     get_program_out ("xinput", "env DISPLAY=:5 xinput --list-props 'SynPS/2 Synaptics TouchPad'",
             out props_out, out props_err, out props_exit);
 
-    /* shut down X */
+    /* shut down X; this requires extra force due to https://launchpad.net/bugs/1853266 */
 #if VALA_0_40
     Posix.kill (xorg_pid, Posix.Signal.TERM);
+    Posix.kill (xorg_pid, Posix.Signal.QUIT);
+    Posix.kill (xorg_pid, Posix.Signal.KILL);
 #else
     Posix.kill (xorg_pid, Posix.SIGTERM);
+    Posix.kill (xorg_pid, Posix.SIGQUIT);
+    Posix.kill (xorg_pid, Posix.SIGKILL);
 #endif
+    try {
+        Process.spawn_sync (null, {"pkill", "-9", "-f", "Xorg.*/tests/xorg-dummy.conf"}, null, SpawnFlags.SEARCH_PATH, null, null, null, null);
+    } catch (Error e) {}
+
     int status;
     Posix.waitpid (xorg_pid, out status, 0);
     Process.close_pid (xorg_pid);
-    FileUtils.remove (logfile);
-    FileUtils.remove (logfile + ".old");
+    checked_remove (logfile);
+    checked_remove (logfile + ".old");
+    // clean up lockfile after killed X server
+    if (FileUtils.remove ("/tmp/.X5-lock") < 0)
+        debug("failed to clean up /tmp/.X5-lock: %m");
+    if (FileUtils.remove ("/tmp/.X11-unix/X5") < 0)
+        debug("failed to clean up .X11-unix/X5: %m");
 
     assert_cmpstr (xinput_err, CompareOperator.EQ, "");
     assert_cmpint (xinput_exit, CompareOperator.EQ, 0);
@@ -549,6 +616,12 @@ t_input_evtest ()
 
     if (!have_program ("evtest")) {
         stdout.printf ("[SKIP: evtest not installed] ");
+        return;
+    }
+
+    unowned string? preload = Environment.get_variable ("LD_PRELOAD");
+    if (preload != null && preload.contains ("vgpreload")) {
+        stdout.printf ("[SKIP: this test does not work under valgrind] ");
         return;
     }
 
@@ -626,6 +699,12 @@ t_input_evtest_evemu ()
         return;
     }
 
+    unowned string? preload = Environment.get_variable ("LD_PRELOAD");
+    if (preload != null && preload.contains ("vgpreload")) {
+        stdout.printf ("[SKIP: this test does not work under valgrind] ");
+        return;
+    }
+
     Pid evtest_pid;
     int outfd, errfd;
 
@@ -655,7 +734,7 @@ E: 0.500000 0001 001e 0000	# EV_KEY / KEY_A                0
 
     // our script covers 0.5 seconds, give it some slack
     Posix.sleep (1 * slow_testbed_factor);
-    FileUtils.remove (evemu_file);
+    checked_remove (evemu_file);
 #if VALA_0_40
     Posix.kill (evtest_pid, Posix.Signal.TERM);
 #else
@@ -713,6 +792,9 @@ main (string[] args)
   Test.add_func ("/umockdev-run/version", t_run_version);
   Test.add_func ("/umockdev-run/pipes", t_run_pipes);
 
+  // udevadm emulation
+  Test.add_func ("/umockdev-run/udevadm-block", t_run_udevadm_block);
+
   // error conditions
   Test.add_func ("/umockdev-run/invalid-args", t_run_invalid_args);
   Test.add_func ("/umockdev-run/invalid-device", t_run_invalid_device);
@@ -720,16 +802,21 @@ main (string[] args)
   Test.add_func ("/umockdev-run/invalid-script", t_run_invalid_script);
   Test.add_func ("/umockdev-run/invalid-program", t_run_invalid_program);
 
+  // udevadm-record interaction
+  Test.add_func ("/umockdev-run/umockdev-record-null-roundtrip", t_run_record_null);
+
   // script replay
   Test.add_func ("/umockdev-run/script-chatter", t_run_script_chatter);
   Test.add_func ("/umockdev-run/script-chatter-socket-stream", t_run_script_chatter_socket_stream);
 
   // tests with gphoto2 program for PowerShot
   Test.add_func ("/umockdev-run/integration/gphoto-detect", t_gphoto_detect);
+  /*
   Test.add_func ("/umockdev-run/integration/gphoto-folderlist", t_gphoto_folderlist);
   Test.add_func ("/umockdev-run/integration/gphoto-filelist", t_gphoto_filelist);
   Test.add_func ("/umockdev-run/integration/gphoto-thumbs", t_gphoto_thumbs);
   Test.add_func ("/umockdev-run/integration/gphoto-download", t_gphoto_download);
+  */
 
   // input devices
   Test.add_func ("/umockdev-run/integration/input-touchpad", t_input_touchpad);

@@ -23,6 +23,18 @@ using UMockdevUtils;
 private bool __in_mock_env_initialized = false;
 private bool __in_mock_env_result = false;
 
+static void checked_mkdir (string path, int mode)
+{
+    if (DirUtils.create(path, mode) < 0)
+        error("cannot create directory %s: %m", path);
+}
+
+static void checked_mkdir_with_parents (string path, int mode)
+{
+    if (DirUtils.create_with_parents(path, mode) < 0)
+        error("cannot create directory with parents %s: %m", path);
+}
+
 /**
  * SECTION:umockdev
  * @title: umockdev
@@ -85,17 +97,19 @@ public class Testbed: GLib.Object {
             error("Cannot create temporary directory: %s", e.message);
         }
         this.sys_dir = Path.build_filename(this.root_dir, "sys");
-        DirUtils.create(this.sys_dir, 0755);
+        checked_mkdir(this.sys_dir, 0755);
 
         /* Create "bus" and "class" directories to make libudev happy */
         string bus_path = Path.build_filename(this.sys_dir, "bus");
-        DirUtils.create(bus_path, 0755);
+        checked_mkdir(bus_path, 0755);
         string class_path = Path.build_filename(this.sys_dir, "class");
-        DirUtils.create(class_path, 0755);
+        checked_mkdir(class_path, 0755);
 
         this.dev_fd = new HashTable<string, int> (str_hash, str_equal);
         this.dev_script_runner = new HashTable<string, ScriptRunner> (str_hash, str_equal);
         this.custom_handlers = new HashTable<string, IoctlBase> (str_hash, str_equal);
+
+        checked_setenv ("UMOCKDEV_DIR", this.root_dir);
 
         this.worker_ctx = new MainContext();
         this.worker_loop = new MainLoop(this.worker_ctx);
@@ -106,7 +120,6 @@ public class Testbed: GLib.Object {
         string sockpath = Path.build_filename(this.root_dir, "ioctl", "_default");
         handler.register_path(this.worker_ctx, "_default", sockpath);
 
-        Environment.set_variable("UMOCKDEV_DIR", this.root_dir, true);
         debug("Created udev test bed %s", this.root_dir);
     }
 
@@ -136,9 +149,8 @@ public class Testbed: GLib.Object {
 
         debug ("Removing test bed %s", this.root_dir);
         remove_dir (this.root_dir);
-        Environment.unset_variable("UMOCKDEV_DIR");
-
         this.worker_loop.quit();
+        Environment.unset_variable("UMOCKDEV_DIR");
     }
 
     /**
@@ -200,8 +212,7 @@ public class Testbed: GLib.Object {
         var attr_path = Path.build_filename(this.root_dir, devpath, name);
         if ("/" in name) {
             string d = Path.get_dirname(attr_path);
-            if (DirUtils.create_with_parents(d, 0755) != 0)
-                error("cannot create attribute subdir '%s': %s", d, strerror(errno));
+            checked_mkdir_with_parents(d, 0755);
         }
 
         try {
@@ -256,10 +267,9 @@ public class Testbed: GLib.Object {
     {
         var path = Path.build_filename(this.root_dir, devpath, name);
         var dir = Path.get_dirname(path);
-        if (DirUtils.create_with_parents(dir, 0755) != 0)
-            error("cannot create attribute dir '%s': %s", dir, strerror(errno));
+        checked_mkdir_with_parents(dir, 0755);
         if (FileUtils.symlink(value, path) < 0) {
-            error("Cannot create symlink %s: %s", path, strerror(errno));
+            error("Cannot create symlink %s: %m", path);
         }
     }
 
@@ -394,6 +404,112 @@ public class Testbed: GLib.Object {
         this.set_property(devpath, name, "%x".printf(value));
     }
 
+    private string? add_devicev_no_uevent(string subsystem, string name, string? parent,
+                                         [CCode(array_null_terminated=true, array_length=false)] string[] attributes,
+                                         [CCode(array_null_terminated=true, array_length=false)] string[] properties)
+    {
+        string dev_path;
+        string? dev_node = null;
+
+        if (parent != null) {
+            if (!parent.has_prefix("/sys/")) {
+                critical("add_devicev(): parent device %s does not start with /sys/", parent);
+                return null;
+            }
+            if (!FileUtils.test(parent, FileTest.IS_DIR)) {
+                critical("add_devicev(): parent device %s does not exist", parent);
+                return null;
+            }
+            dev_path = Path.build_filename(parent, name);
+        } else
+            dev_path = Path.build_filename("/sys/devices", name);
+        var dev_dir = Path.build_filename(this.root_dir, dev_path);
+
+        /* must not exist yet; do allow existing children, though */
+        if (FileUtils.test(dev_dir, FileTest.EXISTS) &&
+            FileUtils.test(Path.build_filename(dev_dir, "uevent"), FileTest.EXISTS))
+            error("device %s already exists", dev_dir);
+
+        string dev_path_no_sys = dev_path.substring(dev_path.index_of("/devices/"));
+
+        /* create device and corresponding subsystem dir */
+        checked_mkdir_with_parents(dev_dir, 0755);
+        if (!subsystem_is_bus(subsystem)) {
+            /* class/ symlinks */
+            var class_dir = Path.build_filename(this.sys_dir, "class", subsystem);
+            checked_mkdir_with_parents(class_dir, 0755);
+
+            /* subsystem symlink */
+            assert(FileUtils.symlink(Path.build_filename(make_dotdots(dev_path), "class", subsystem),
+                                     Path.build_filename(dev_dir, "subsystem")) == 0);
+
+            /* device symlink from class/; skip directories in name; this happens
+             * when being called from add_from_string() when the parent devices do
+             * not exist yet */
+            assert(FileUtils.symlink(Path.build_filename("..", "..", dev_path_no_sys),
+                                     Path.build_filename(class_dir, Path.get_basename(name))) == 0);
+        } else {
+            /* bus symlink */
+            var bus_dir = Path.build_filename(this.sys_dir, "bus", subsystem, "devices");
+            checked_mkdir_with_parents(bus_dir, 0755);
+            assert(FileUtils.symlink(Path.build_filename("..", "..", "..", dev_path_no_sys),
+                                     Path.build_filename(bus_dir, Path.get_basename(name))) == 0);
+
+            /* subsystem symlink */
+            assert(FileUtils.symlink(Path.build_filename(make_dotdots(dev_path), "bus", subsystem),
+                                     Path.build_filename(dev_dir, "subsystem")) == 0);
+        }
+
+        /* /sys/block symlink */
+        if (subsystem == "block") {
+            var block_dir = Path.build_filename(this.sys_dir, "block");
+            checked_mkdir_with_parents(block_dir, 0755);
+            assert (FileUtils.symlink(Path.build_filename("..", dev_path_no_sys),
+                                     Path.build_filename(block_dir, Path.get_basename(name))) == 0);
+        }
+
+        /* properties; they go into the "uevent" sysfs attribute */
+        string props = "";
+        for (int i = 0; i < properties.length - 1; i += 2) {
+            /* the kernel sets DEVNAME without prefix */
+            if (properties[i] == "DEVNAME" && properties[i+1].has_prefix("/dev/")) {
+                dev_node = properties[i+1].substring(5);
+                props += "DEVNAME=" + dev_node + "\n";
+            } else
+                props += properties[i] + "=" + properties[i+1] + "\n";
+        }
+        if (properties.length % 2 != 0)
+            warning("add_devicev: Ignoring property key '%s' without value", properties[properties.length-1]);
+        this.set_attribute(dev_path, "uevent", props);
+
+        /* attributes */
+        for (int i = 0; i < attributes.length - 1; i += 2) {
+            this.set_attribute(dev_path, attributes[i], attributes[i+1]);
+            if (attributes[i] == "dev" && dev_node != null) {
+                var val = attributes[i+1].strip(); // strip off trailing \n
+                /* put the major/minor information into /dev for our preload */
+                string infodir = Path.build_filename(this.root_dir, "dev", ".node");
+                checked_mkdir_with_parents(infodir, 0755);
+                assert(FileUtils.symlink(val, Path.build_filename(infodir, dev_node.replace("/", "_"))) == 0);
+
+                /* create a /sys/dev link for it, like in real sysfs */
+                string sysdev_dir = Path.build_filename(this.sys_dir, "dev",
+                    (dev_path.contains("/block/") ? "block" : "char"));
+                checked_mkdir_with_parents(sysdev_dir, 0755);
+                string dest = Path.build_filename(sysdev_dir, val);
+                if (!FileUtils.test(dest, FileTest.EXISTS)) {
+                    if (FileUtils.symlink("../../" + dev_path.substring(5), dest) < 0)
+                        error("add_device %s: failed to symlink %s to %s: %m", name, dest,
+                              dev_path.substring(5));
+                }
+            }
+        }
+        if (attributes.length % 2 != 0)
+            warning("add_devicev: Ignoring attribute key '%s' without value", attributes[attributes.length-1]);
+
+        return dev_path;
+    }
+
     /**
      * umockdev_testbed_add_devicev:
      * @self: A #UMockdevTestbed.
@@ -422,6 +538,8 @@ public class Testbed: GLib.Object {
      * possible to change them later on with umockdev_testbed_set_attribute() and
      * umockdev_testbed_set_property().
      *
+     * This will synthesize an "add" uevent.
+     *
      * Returns: The sysfs path for the newly created device. Free with g_free().
      *
      * Rename to: umockdev_testbed_add_device
@@ -430,110 +548,9 @@ public class Testbed: GLib.Object {
                                [CCode(array_null_terminated=true, array_length=false)] string[] attributes,
                                [CCode(array_null_terminated=true, array_length=false)] string[] properties)
     {
-        string dev_path;
-        string? dev_node = null;
+        string? dev_path = this.add_devicev_no_uevent(subsystem, name, parent, attributes, properties);
 
-        if (parent != null) {
-            if (!parent.has_prefix("/sys/")) {
-                critical("add_devicev(): parent device %s does not start with /sys/", parent);
-                return null;
-            }
-            if (!FileUtils.test(parent, FileTest.IS_DIR)) {
-                critical("add_devicev(): parent device %s does not exist", parent);
-                return null;
-            }
-            dev_path = Path.build_filename(parent, name);
-        } else
-            dev_path = Path.build_filename("/sys/devices", name);
-        var dev_dir = Path.build_filename(this.root_dir, dev_path);
-
-        /* must not exist yet; do allow existing children, though */
-        if (FileUtils.test(dev_dir, FileTest.EXISTS) &&
-            FileUtils.test(Path.build_filename(dev_dir, "uevent"), FileTest.EXISTS))
-            error("device %s already exists", dev_dir);
-
-        string dev_path_no_sys = dev_path.substring(dev_path.index_of("/devices/"));
-
-        /* create device and corresponding subsystem dir */
-        if (DirUtils.create_with_parents(dev_dir, 0755) != 0)
-            error("cannot create dev dir '%s': %s", dev_dir, strerror(errno));
-        if (!subsystem_is_bus(subsystem)) {
-            /* class/ symlinks */
-            var class_dir = Path.build_filename(this.sys_dir, "class", subsystem);
-            if (DirUtils.create_with_parents(class_dir, 0755) != 0)
-                error("cannot create class dir '%s': %s", class_dir, strerror(errno));
-
-            /* subsystem symlink */
-            assert(FileUtils.symlink(Path.build_filename(make_dotdots(dev_path), "class", subsystem),
-                                     Path.build_filename(dev_dir, "subsystem")) == 0);
-
-            /* device symlink from class/; skip directories in name; this happens
-             * when being called from add_from_string() when the parent devices do
-             * not exist yet */
-            assert(FileUtils.symlink(Path.build_filename("..", "..", dev_path_no_sys),
-                                     Path.build_filename(class_dir, Path.get_basename(name))) == 0);
-        } else {
-            /* bus symlink */
-            var bus_dir = Path.build_filename(this.sys_dir, "bus", subsystem, "devices");
-            assert(DirUtils.create_with_parents(bus_dir, 0755) == 0);
-            assert(FileUtils.symlink(Path.build_filename("..", "..", "..", dev_path_no_sys),
-                                     Path.build_filename(bus_dir, Path.get_basename(name))) == 0);
-
-            /* subsystem symlink */
-            assert(FileUtils.symlink(Path.build_filename(make_dotdots(dev_path), "bus", subsystem),
-                                     Path.build_filename(dev_dir, "subsystem")) == 0);
-        }
-
-        /* /sys/block symlink */
-        if (subsystem == "block") {
-            var block_dir = Path.build_filename(this.sys_dir, "block");
-            if (DirUtils.create_with_parents(block_dir, 0755) != 0)
-                error("cannot create block dir '%s': %s", block_dir, strerror(errno));
-            assert (FileUtils.symlink(Path.build_filename("..", dev_path_no_sys),
-                                     Path.build_filename(block_dir, Path.get_basename(name))) == 0);
-        }
-
-        /* properties; they go into the "uevent" sysfs attribute */
-        string props = "";
-        for (int i = 0; i < properties.length - 1; i += 2) {
-            /* the kernel sets DEVNAME without prefix */
-            if (properties[i] == "DEVNAME" && properties[i+1].has_prefix("/dev/")) {
-                dev_node = properties[i+1].substring(5);
-                props += "DEVNAME=" + dev_node + "\n";
-            } else
-                props += properties[i] + "=" + properties[i+1] + "\n";
-        }
-        if (properties.length % 2 != 0)
-            warning("add_devicev: Ignoring property key '%s' without value", properties[properties.length-1]);
-        this.set_attribute(dev_path, "uevent", props);
-
-        /* attributes */
-        for (int i = 0; i < attributes.length - 1; i += 2) {
-            this.set_attribute(dev_path, attributes[i], attributes[i+1]);
-            if (attributes[i] == "dev" && dev_node != null) {
-                /* put the major/minor information into /dev for our preload */
-                string infodir = Path.build_filename(this.root_dir, "dev", ".node");
-                DirUtils.create_with_parents(infodir, 0755);
-                assert(FileUtils.symlink(attributes[i+1],
-                                         Path.build_filename(infodir, dev_node.replace("/", "_"))) == 0);
-
-                /* create a /sys/dev link for it, like in real sysfs */
-                string sysdev_dir = Path.build_filename(this.sys_dir, "dev",
-                    (dev_path.contains("/block/") ? "block" : "char"));
-                if (DirUtils.create_with_parents(sysdev_dir, 0755) != 0)
-                    error("cannot create dir '%s': %s", sysdev_dir, strerror(errno));
-                string dest = Path.build_filename(sysdev_dir, attributes[i+1]);
-                if (!FileUtils.test(dest, FileTest.EXISTS)) {
-                    if (FileUtils.symlink("../../" + dev_path.substring(5), dest) < 0)
-                        error("add_device %s: failed to symlink %s to %s: %s", name, dest,
-                              dev_path.substring(5), strerror(errno));
-                }
-            }
-        }
-        if (attributes.length % 2 != 0)
-            warning("add_devicev: Ignoring attribute key '%s' without value", attributes[attributes.length-1]);
-
-        if (in_mock_environment ())
+        if (dev_path != null && in_mock_environment ())
             uevent(dev_path, "add");
 
         return dev_path;
@@ -559,6 +576,8 @@ public class Testbed: GLib.Object {
      * properties; usually you should specify them upon creation, but it is also
      * possible to change them later on with umockdev_testbed_set_attribute() and
      * umockdev_testbed_set_property().
+     *
+     * This will synthesize an "add" uevent.
      *
      * Example:
      *   |[
@@ -754,7 +773,15 @@ public class Testbed: GLib.Object {
             assert(this.ev_sender != null);
         }
         debug("umockdev_testbed_uevent: sending uevent %s for device %s", action, devpath);
-        this.ev_sender.send(devpath, action);
+
+        var uevent_path = Path.build_filename(this.root_dir, devpath, "uevent");
+        var properties = "";
+        try {
+            FileUtils.get_contents(uevent_path, out properties);
+        } catch (FileError e) {
+            debug("uevent: devpath %s has no uevent file: %s",  devpath, e.message);
+        }
+        this.ev_sender.send(devpath, action, properties);
     }
 
     /**
@@ -874,7 +901,7 @@ public class Testbed: GLib.Object {
         recording.seek(0, SeekType.SET);
 
         string dest = Path.build_filename(this.root_dir, "ioctl", owned_dev + ".tree");
-        assert(DirUtils.create_with_parents(Path.get_dirname(dest), 0755) == 0);
+        checked_mkdir_with_parents(Path.get_dirname(dest), 0755);
 
         string? contents = recording.read_upto("", 0, null);
         if (contents == null)
@@ -924,7 +951,7 @@ public class Testbed: GLib.Object {
 
         sockpath = Path.build_filename(this.root_dir, "ioctl", owned_dev);
 
-        assert(DirUtils.create_with_parents(Path.get_dirname(sockpath), 0755) == 0);
+        checked_mkdir_with_parents(Path.get_dirname(sockpath), 0755);
 
         IoctlUsbPcapHandler handler = new IoctlUsbPcapHandler(recordfile, busnum, devnum);
         handler.register_path(this.worker_ctx, owned_dev, sockpath);
@@ -998,13 +1025,10 @@ public class Testbed: GLib.Object {
     {
         int fd = Posix.socket (Posix.AF_UNIX, type, 0);
         if (fd < 0)
-            throw new FileError.INVAL ("Cannot create socket type %i: %s".printf(
-                                       type, strerror(errno)));
+            throw new FileError.INVAL ("Cannot create socket type %i: %m".printf(type));
 
         string real_path = Path.build_filename (this.root_dir, path);
-        if (DirUtils.create_with_parents(Path.get_dirname(real_path), 0755) != 0)
-            throw new FileError.INVAL ("Cannot create socket path: %s".printf(
-                                       strerror(errno)));
+        checked_mkdir_with_parents(Path.get_dirname(real_path), 0755);
 
         // start thread to accept client connections at first socket creation
         if (this.socket_server == null)
@@ -1103,7 +1127,7 @@ public class Testbed: GLib.Object {
         return ret;
     }
 
-    private static static HashTable<string, string> bus_lookup_table;
+    private static HashTable<string, string> bus_lookup_table;
 
     private static HashTable<string, string> create_bus_lookup() {
         var lookup = new HashTable<string, string?>(str_hash, str_equal);
@@ -1340,9 +1364,9 @@ public class Testbed: GLib.Object {
             throw new UMockdev.Error.VALUE("missing SUBSYSTEM property in description of device %s",
                                        devpath);
         debug("creating device %s (subsystem %s)", devpath, subsystem);
-        string syspath = this.add_devicev(subsystem,
-                                          devpath.substring(9), // chop off "/devices/"
-                                          null, attrs, props);
+        string syspath = this.add_devicev_no_uevent(subsystem,
+                                                    devpath.substring(9), // chop off "/devices/"
+                                                    null, attrs, props);
 
         /* add binary attributes */
         for (int i = 0; i < binattrs.length; i += 2)
@@ -1358,7 +1382,7 @@ public class Testbed: GLib.Object {
 
             /* create symlinks */
             for (int i = 0; i < devnode_links.length; i++) {
-                assert (DirUtils.create_with_parents(Path.get_dirname(devnode_links[i]), 0755) == 0);
+                checked_mkdir_with_parents(Path.get_dirname(devnode_links[i]), 0755);
                 if (FileUtils.symlink(devnode_path, devnode_links[i]) < 0)
                     warning ("failed to create %s -> %s symlink for device %s: %m",
                              devnode_links[i], devnode_path, devpath);
@@ -1369,6 +1393,9 @@ public class Testbed: GLib.Object {
         while (cur_data[0] != '\0' && cur_data[0] == '\n')
             cur_data = cur_data.next_char();
 
+        if (in_mock_environment ())
+            uevent(syspath, "add");
+
         return cur_data;
     }
 
@@ -1376,7 +1403,7 @@ public class Testbed: GLib.Object {
     create_node_for_device (string subsystem, string node_path, uint8[] node_contents, string? majmin)
         throws UMockdev.Error
     {
-        assert (DirUtils.create_with_parents(Path.get_dirname(node_path), 0755) == 0);
+        checked_mkdir_with_parents(Path.get_dirname(node_path), 0755);
 
         // for pre-defined contents, block, and USB devices we create a normal file
         if (node_contents.length > 0 || subsystem == "block" || subsystem == "usb") {
@@ -1398,7 +1425,7 @@ public class Testbed: GLib.Object {
         int ptym, ptys;
         char[] ptyname_array = new char[8192];
         if (Linux.openpty (out ptym, out ptys, ptyname_array, null, null) < 0)
-            error ("umockdev Testbed.create_node_for_device: openpty() failed: %s", strerror (errno));
+            error ("umockdev Testbed.create_node_for_device: openpty() failed: %m");
         string ptyname = (string) ptyname_array;
         debug ("create_node_for_device: creating pty device %s: got pty %s", node_path, ptyname);
         Posix.close (ptys);
@@ -1419,7 +1446,7 @@ public class Testbed: GLib.Object {
         // we can map from an fd -> ttyname -> device we emulate
         if (majmin != null) {
             string mapdir = Path.build_filename (this.root_dir, "dev", ".ptymap");
-            DirUtils.create_with_parents (mapdir, 0755);
+            checked_mkdir_with_parents (mapdir, 0755);
             string dest = Path.build_filename (mapdir, ptyname.replace("/", "_"));
             debug ("create_node_for_device: creating ptymap symlink %s", dest);
             assert (FileUtils.symlink(majmin, dest) == 0);
@@ -1501,7 +1528,8 @@ public class Testbed: GLib.Object {
      */
     public void enable()
     {
-        FileUtils.remove(Path.build_filename(this.root_dir, "disabled"));
+        if (FileUtils.remove(Path.build_filename(this.root_dir, "disabled")) < 0)
+            debug("enable: failed to remove /disabled flag, ignoring: %m");
     }
 
     /**
@@ -1516,7 +1544,7 @@ public class Testbed: GLib.Object {
     {
         remove_dir (this.root_dir, false);
         // /sys should always exist
-        DirUtils.create(this.sys_dir, 0755);
+        checked_mkdir_with_parents(this.sys_dir, 0755);
     }
 
     /**
@@ -1684,7 +1712,7 @@ private class ScriptRunner {
                     debug ("ScriptRunner[%s]: read op after sleep; writing data '%s'", this.device, encode(data));
                     ssize_t l = Posix.write (this.fd, data, data.length);
                     if (l < 0)
-                        error ("ScriptRunner[%s]: write failed: %s", this.device, strerror (errno));
+                        error ("ScriptRunner[%s]: write failed: %m", this.device);
                     assert (l == data.length);
                     break;
 
@@ -1770,8 +1798,7 @@ private class ScriptRunner {
             if (res < 0) {
                 if (errno == Posix.EINTR)
                     continue;
-                error ("ScriptRunner op_write[%s]: select() failed: %s",
-                       this.device, strerror (errno));
+                error ("ScriptRunner op_write[%s]: select() failed: %m", this.device);
             }
 
             if (res == 0) {
@@ -1961,7 +1988,7 @@ private class SocketServer {
             if (res < 0) {
                 if (errno == Posix.EINTR)
                     continue;
-                error ("socket server thread: select() failed: %s", strerror (errno));
+                error ("socket server thread: select() failed: %m");
             }
             if (res == 0)
                 continue;  // timeout
@@ -1988,7 +2015,7 @@ private class SocketServer {
                 if (Posix.FD_ISSET (s.fd, fds) > 0) {
                     int fd = Posix.accept (s.fd, null, null);
                     if (fd < 0)
-                        error ("socket server thread: accept() failed: %s", strerror (errno));
+                        error ("socket server thread: accept() failed: %m");
                     string sock_path = null;
                     try {
                         sock_path = ((UnixSocketAddress) s.get_local_address()).path;
@@ -2022,7 +2049,7 @@ private class SocketServer {
  * @title: global functions
  * @short_description: Global functions
  *
- * These work independently from #Testbed objects.
+ * These work independently from #UMockdevTestbed objects.
  */
 
 /**

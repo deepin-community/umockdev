@@ -30,7 +30,10 @@
 
 #include <libudev.h>
 
+#include "utils.h"
 #include "uevent_sender.h"
+
+#define UEVENT_BUFSIZE 16384
 
 struct _uevent_sender {
     char *rootpath;
@@ -49,7 +52,7 @@ uevent_sender_open(const char *rootpath)
 	perror("uevent_sender_open: cannot allocate struct");
 	abort();
     }
-    s->rootpath = strdup(rootpath);
+    s->rootpath = strdupx(rootpath);
     s->udev = udev_new();
     snprintf(s->socket_glob, sizeof(s->socket_glob), "%s/event[0-9]*", rootpath);
 
@@ -65,12 +68,11 @@ uevent_sender_close(uevent_sender * sender)
 }
 
 static void
-sendmsg_one(struct msghdr *msg, const char *path)
+sendmsg_one(struct iovec *iov, size_t iov_len, const char *path)
 {
     struct sockaddr_un event_addr;
     int fd;
     int ret;
-    /* ssize_t count; */
 
     /* create uevent socket address */
     strncpy(event_addr.sun_path, path, sizeof(event_addr.sun_path) - 1);
@@ -88,20 +90,25 @@ sendmsg_one(struct msghdr *msg, const char *path)
 	if (errno == ECONNREFUSED) {
 	    /* client side closed its monitor underneath us, so clean up and ignore */
 	    unlink(event_addr.sun_path);
+	    close(fd);
 	    return;
 	}
 	perror("sendmsg_one: cannot connect to client's event socket");
 	abort();
     }
 
-    msg->msg_name = &event_addr;
-    /* count = */ sendmsg(fd, msg, 0);
+    const struct msghdr msg = { .msg_name = &event_addr, .msg_iov = iov, .msg_iovlen = iov_len };
+    ssize_t count = sendmsg(fd, &msg, 0);
+    if (count < 0) {
+        perror("uevent_sender sendmsg_one: sendmsg failed");
+        abort();
+    }
     /* printf("passed %zi bytes to event socket %s\n", count, path); */
     close(fd);
 }
 
 static void
-sendmsg_all(uevent_sender * sender, struct msghdr *msg)
+sendmsg_all(uevent_sender * sender, struct iovec *iov, size_t iov_len)
 {
     glob_t gl;
     int res;
@@ -111,7 +118,7 @@ sendmsg_all(uevent_sender * sender, struct msghdr *msg)
     if (res == 0) {
 	size_t i;
 	for (i = 0; i < gl.gl_pathc; ++i)
-	    sendmsg_one(msg, gl.gl_pathv[i]);
+	    sendmsg_one(iov, iov_len, gl.gl_pathv[i]);
     } else {
 	/* ensure that we only fail due to that, not due to bad globs */
 	if (res != GLOB_NOMATCH) {
@@ -198,33 +205,37 @@ string_hash32(const char *str)
     return h;
 }
 
-static ssize_t
-append_property(char *array, size_t size, ssize_t offset, const char *name, const char *value)
+static size_t
+append_property(char *array, size_t size, size_t offset, const char *name, const char *value)
 {
     int r;
     assert(offset < size);
     r = snprintf(array + offset, size - offset, "%s%s", name, value);
-    // include the NUL terminator in the string length, as we need to keep it as a separator between keys
-    ++r;
+    if (r < 0) {
+        fprintf(stderr, "ERROR: snprintf failed");
+        abort();
+    }
     if (r + offset >= size) {
         fprintf(stderr, "ERROR: uevent_sender_send: Property buffer overflow\n");
         abort();
-     }
+    }
 
-    return r;
+    /* this is already true as snprintf always writes the NUL, but -fanalyzer complains about use-of-uninitialized-value */
+    array[offset + r] = '\0';
+
+    /* include the NUL terminator in the string length, as we need to keep it as a separator between keys */
+    return r + 1;
 }
 
-/* this mirrors the code from systemd/src/libudev/libudev-monitor.c,
- * udev_monitor_send_device() */
+/* this mirrors the code from systemd/src/libsystemd/sd-device/device-monitor.c,
+ * device_monitor_send_device() */
 void
-uevent_sender_send(uevent_sender * sender, const char *devpath, const char *action)
+uevent_sender_send(uevent_sender * sender, const char *devpath, const char *action, const char *properties)
 {
-    char props[1024];
-    ssize_t count;
-    struct msghdr smsg;
+    char buffer[UEVENT_BUFSIZE];
+    size_t buffer_len = 0;
     struct iovec iov[2];
     const char *subsystem;
-    const char *devname;
     const char *devtype;
     char seqnumstr[20];
     struct udev_device *device;
@@ -240,20 +251,28 @@ uevent_sender_send(uevent_sender * sender, const char *devpath, const char *acti
     subsystem = udev_device_get_subsystem(device);
     assert(subsystem != NULL);
 
-    devname = udev_device_get_devnode(device);
     devtype = udev_device_get_devtype(device);
 
     /* build NUL-terminated property array */
-    count = 0;
-    count += append_property(props, sizeof (props), count, "ACTION=", action);
-    count += append_property(props, sizeof (props), count, "DEVPATH=", udev_device_get_devpath(device));
-    count += append_property(props, sizeof (props), count, "SUBSYSTEM=", subsystem);
+    buffer_len += append_property(buffer, sizeof buffer, buffer_len, "ACTION=", action);
+    buffer_len += append_property(buffer, sizeof buffer, buffer_len, "DEVPATH=", udev_device_get_devpath(device));
+    buffer_len += append_property(buffer, sizeof buffer, buffer_len, "SUBSYSTEM=", subsystem);
     snprintf(seqnumstr, sizeof(seqnumstr), "%llu", seqnum++);
-    count += append_property(props, sizeof (props), count, "SEQNUM=", seqnumstr);
-    if (devname)
-        count += append_property(props, sizeof (props), count, "DEVNAME=", devname);
-    if (devtype)
-        count += append_property(props, sizeof (props), count, "DEVTYPE=", devtype);
+    buffer_len += append_property(buffer, sizeof buffer, buffer_len, "SEQNUM=", seqnumstr);
+
+    /* append udevd (userland) properties, replace \n with \0 */
+    /* FIXME: more sensible API */
+    size_t properties_len = properties ? strlen(properties) : 0;
+    if (properties_len > 0) {
+        size_t prop_ofs = buffer_len;
+        buffer_len += append_property(buffer, sizeof buffer, buffer_len, properties, "");
+        for (size_t i = prop_ofs; i < buffer_len - 1; ++i)
+            if (buffer[i] == '\n')
+                buffer[i] = '\0';
+        /* avoid empty property at the end from final line break */
+        if (properties[strlen(properties) - 1] == '\n')
+            --buffer_len;
+    }
 
     /* add versioned header */
     memset(&nlh, 0x00, sizeof(struct udev_monitor_netlink_header));
@@ -274,14 +293,10 @@ uevent_sender_send(uevent_sender * sender, const char *devpath, const char *acti
 
     /* add properties list */
     nlh.properties_off = iov[0].iov_len;
-    nlh.properties_len = count;
-    iov[1].iov_base = props;
-    iov[1].iov_len = count;
+    nlh.properties_len = buffer_len;
+    iov[1].iov_base = buffer;
+    iov[1].iov_len = buffer_len;
 
     /* send message */
-    memset(&smsg, 0x00, sizeof(struct msghdr));
-    smsg.msg_iov = iov;
-    smsg.msg_iovlen = 2;
-
-    sendmsg_all(sender, &smsg);
+    sendmsg_all(sender, iov, 2);
 }

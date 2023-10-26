@@ -1,3 +1,132 @@
+umockdev (0.17.18-1) unstable; urgency=medium
+
+  * New upstream bug fix release:
+    - preload: Don't read udev cache data from system
+    - Various test fixes
+
+ -- Martin Pitt <mpitt@debian.org>  Wed, 26 Jul 2023 08:03:22 +0000
+
+umockdev (0.17.17-1) unstable; urgency=medium
+
+  * New upstream bug fix release:
+    - Fix race with worker thread accessing $UMOCKDEV_DIR
+
+ -- Martin Pitt <mpitt@debian.org>  Sun, 16 Apr 2023 08:28:23 +0000
+
+umockdev (0.17.16-1) unstable; urgency=medium
+
+  * New upstream release:
+    - preload: Wrap __getcwd_chk()
+    - uevent_sender: Fix fd leak in sendmsg_one
+    - Fix gcc -fanalyzer complaints
+  * debian/libumockdev0.symbols: Add new symbols from 0.17.13
+  * Bump Standards-Version to 4.6.2.  No changes necessary.
+  * debian/watch: Use GitHub API. The /releases page has become JavaScript-y
+    recently and thus unreadable by machines. Scan the API instead and
+    construct a download URL.
+
+ -- Martin Pitt <mpitt@debian.org>  Sun, 29 Jan 2023 19:46:52 +0100
+
+umockdev (0.17.14-1) unstable; urgency=medium
+
+  [ Martin Pitt ]
+  * New upstream release:
+    - ioctl: Make data object usable from Python (thanks Benjamin Berg)
+    - preload: Wrap statfs()
+    - Move to gnu11 C standard
+    - Lots of small potential bug fixes spotted by Coverity
+
+  [ Debian Janitor ]
+  * Apply multi-arch hints. + gir1.2-umockdev-1.0: Add Multi-Arch: same.
+  * Set upstream metadata fields: Bug-Database, Bug-Submit, Repository-Browse.
+  * Update standards version to 4.6.1, no changes needed.
+
+ -- Martin Pitt <mpitt@debian.org>  Thu, 24 Nov 2022 15:25:58 +0100
+
+umockdev (0.17.13-1) unstable; urgency=medium
+
+  * New upstream bug fix release:
+    - preload: Wrap fstatfs(), to work with systemd 251 also with Python tests
+    - Fix documentation build
+
+ -- Martin Pitt <mpitt@debian.org>  Mon, 30 May 2022 12:31:13 +0200
+
+umockdev (0.17.10-1) unstable; urgency=medium
+
+  * New upstream bug fix release:
+    - preload: Wrap fortified version of readlinkat
+    - Adjust to systemd 251-rc2: Set $SYSTEMD_DEVICE_VERIFY_SYSFS, parse new
+      udevadm format, update tests
+
+ -- Martin Pitt <mpitt@debian.org>  Tue, 10 May 2022 10:45:56 +0200
+
+umockdev (0.17.8-1) unstable; urgency=medium
+
+  * New upstream bug fix release:
+    - Fix some potential crashes spotted by Coverity
+
+ -- Martin Pitt <mpitt@debian.org>  Sat, 02 Apr 2022 09:01:49 +0200
+
+umockdev (0.17.7-1) unstable; urgency=medium
+
+  * New upstream bug fix release:
+    - Fix uevent race condition in umockdev_testbed_add_from_string()
+
+ -- Martin Pitt <mpitt@debian.org>  Tue, 01 Mar 2022 06:54:06 +0100
+
+umockdev (0.17.6-1) unstable; urgency=medium
+
+  * New upstream version 0.17.6:
+    - Increase uevent buffer size
+
+ -- Martin Pitt <mpitt@debian.org>  Fri, 21 Jan 2022 13:21:32 +0100
+
+umockdev (0.17.5-1) unstable; urgency=medium
+
+  * New upstream version 0.17.5:
+    - Relax overzealous stat nlink unit test
+
+ -- Martin Pitt <mpitt@debian.org>  Tue, 18 Jan 2022 11:22:53 +0100
+
+umockdev (0.17.4-1) unstable; urgency=medium
+
+  * New upstream version 0.17.4:
+    - Include udev properties in emulated netlink messages, to work with
+      recent libudev.
+
+ -- Martin Pitt <mpitt@debian.org>  Tue, 18 Jan 2022 11:02:41 +0100
+
+umockdev (0.17.3-1) unstable; urgency=medium
+
+  * New upstream version 0.17.3:
+    - tests: Work around broken HIDIOCGRDESCSIZE ioctl on big-endian
+      architectures.
+
+ -- Martin Pitt <mpitt@debian.org>  Tue, 11 Jan 2022 08:00:56 +0100
+
+umockdev (0.17.2-1) unstable; urgency=medium
+
+  * New upstream version 0.17.2:
+    - preload: Wrap statx() and fstatat(), to fix ls and other tools on recent
+      glibc versions.
+
+ -- Martin Pitt <mpitt@debian.org>  Mon, 10 Jan 2022 09:03:52 +0100
+
+umockdev (0.17.1-1) unstable; urgency=medium
+
+  * New upstream version 0.17.1:
+    - Fix /sys/dev/* symlinks; regression from 0.15.3
+
+ -- Martin Pitt <mpitt@debian.org>  Tue, 14 Dec 2021 07:33:20 +0100
+
+umockdev (0.17.0-1) unstable; urgency=medium
+
+  * New upstream version 0.17.0:
+    - Add ioctls necessary to record/replay hidraw devices (thanks Daiki Ueno)
+    - meson: Respect includedir option (thanks Florentin Dubois)
+
+ -- Martin Pitt <mpitt@debian.org>  Sat, 11 Dec 2021 11:02:30 +0100
+
 umockdev (0.16.3-1) unstable; urgency=medium
 
   * New upstream version 0.16.3:

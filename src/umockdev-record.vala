@@ -23,14 +23,6 @@
 using UMockdevUtils;
 
 static void
-exit_error(string message, ...)
-{
-    stderr.vprintf(message, va_list());
-    stderr.puts("\n");
-    Process.exit(1);
-}
-
-static void
 devices_from_dir (string dir, ref GenericArray<string> devs)
 {
     Dir d;
@@ -75,7 +67,7 @@ resolve (string dev)
 {
     Posix.Stat st;
     if (Posix.stat(dev, out st) != 0)
-        exit_error("Cannot access device %s: %s", dev, strerror(errno));
+        error("Cannot access device %s: %m", dev);
 
     uint maj = Posix.major(st.st_rdev);
     uint min = Posix.minor(st.st_rdev);
@@ -96,7 +88,7 @@ resolve (string dev)
         real = link;
 
     if (!FileUtils.test(Path.build_filename(real, "uevent"), FileTest.EXISTS))
-        exit_error("Invalid device %s, has no uevent attribute", real);
+        error("Invalid device %s, has no uevent attribute", real);
 
     return real;
 }
@@ -175,7 +167,7 @@ print_device_attributes(string devpath, string subdir)
         d = Dir.open(attr_dir);
     } catch (Error e) {
         if (subdir == "") {
-            exit_error("Cannot open directory %s: %s", attr_dir, e.message);
+            error("Cannot open directory %s: %s", attr_dir, e.message);
         } else {
             // we ignore this on subdirs, some might be transient or
             // inaccessible
@@ -204,7 +196,7 @@ print_device_attributes(string devpath, string subdir)
             try {
                 stdout.printf("L: %s=%s\n", attr_name, FileUtils.read_link(attr_path));
             } catch (Error e) {
-                exit_error("Cannot read link %s: %s", attr_path, e.message);
+                error("Cannot read link %s: %s", attr_path, e.message);
             }
         } else if (FileUtils.test(attr_path, FileTest.IS_REGULAR)) {
             uint8[] contents;
@@ -238,9 +230,10 @@ record_device(string dev)
         if (exitcode != 0)
             throw new SpawnError.FAILED("udevadm exited with code %i\n%s".printf(exitcode, u_err));
     } catch (Error e) {
-        exit_error("Cannot call udevadm: %s", e.message);
+        error("Cannot call udevadm: %s", e.message);
     }
 
+    var properties = new List<string>();
     foreach (string line in u_out.split("\n")) {
         // filter out redundant/uninteresting properties and link priority
         if (line.length == 0 || line.has_prefix("E: DEVPATH=") ||
@@ -248,10 +241,26 @@ record_device(string dev)
             line.has_prefix("L: "))
             continue;
 
+        if (line.has_prefix("E: ")) {
+            properties.append(line);
+            continue;
+        }
+
+        // only pass through field types that we can recognize; keep this in sync with add_dev_from_string()
+        if (!line.has_prefix("P:") && !line.has_prefix("A:") && !line.has_prefix("N:") && !line.has_prefix("S:"))
+            continue;
+
         if (line.has_prefix("N: ")) {
             line = line + dev_contents("/dev/" + line.substring(3).chomp());
         }
         stdout.puts(line);
+        stdout.putc('\n');
+    }
+
+    // print sorted properties
+    properties.sort(strcmp);
+    foreach (var prop in properties) {
+        stdout.puts(prop);
         stdout.putc('\n');
     }
 
@@ -288,14 +297,14 @@ split_devfile_arg(string arg, out string dev, out string devnum, out bool is_blo
 {
     string[] parts = arg.split ("=", 2); // devname, ioctlfilename
     if (parts.length != 2)
-        exit_error("--ioctl argument must be devname=filename");
+        error("--ioctl argument must be devname=filename");
     dev = parts[0];
     fname = parts[1];
 
     // build device major/minor
     Posix.Stat st;
     if (Posix.stat(dev, out st) != 0)
-        exit_error("Cannot access device %s: %s", dev, strerror(errno));
+        error("Cannot access device %s: %m", dev);
 
     is_block = Posix.S_ISBLK(st.st_mode);
     if (Posix.S_ISCHR(st.st_mode) || Posix.S_ISBLK(st.st_mode)) {
@@ -309,7 +318,7 @@ split_devfile_arg(string arg, out string dev, out string devnum, out bool is_blo
         try {
             FileUtils.get_contents(Path.build_filename(dev, "dev"), out devnum);
         } catch (Error e) {
-            exit_error("Cannot open %s/dev: %s", dev, e.message);
+            error("Cannot open %s/dev: %s", dev, e.message);
         }
     }
 }
@@ -345,10 +354,10 @@ record_script(string arg, string format)
     split_devfile_arg(arg, out dev, out devnum, out is_block, out outfile);
     string c = record_script_counter.to_string();
 
-    Environment.set_variable("UMOCKDEV_SCRIPT_RECORD_FILE_" + c, outfile, true);
-    Environment.set_variable("UMOCKDEV_SCRIPT_RECORD_DEV_" + c, devnum, true);
-    Environment.set_variable("UMOCKDEV_SCRIPT_RECORD_DEVICE_PATH_" + c, dev, true);
-    Environment.set_variable("UMOCKDEV_SCRIPT_RECORD_FORMAT_" + c, format, true);
+    checked_setenv("UMOCKDEV_SCRIPT_RECORD_FILE_" + c, outfile);
+    checked_setenv("UMOCKDEV_SCRIPT_RECORD_DEV_" + c, devnum);
+    checked_setenv("UMOCKDEV_SCRIPT_RECORD_DEVICE_PATH_" + c, dev);
+    checked_setenv("UMOCKDEV_SCRIPT_RECORD_FORMAT_" + c, format);
 
     record_script_counter++;
 }
@@ -399,7 +408,7 @@ main (string[] args)
     try {
         oc.parse (ref args);
     } catch (Error e) {
-        exit_error("Error: %s\nRun %s --help for how to use this program", e.message, args[0]);
+        error("Error: %s\nRun %s --help for how to use this program", e.message, args[0]);
     }
 
     if (opt_version) {
@@ -408,12 +417,12 @@ main (string[] args)
     }
 
     if (opt_all && opt_devices.length > 0)
-        exit_error("Specifying a device list together with --all is invalid.");
+        error("Specifying a device list together with --all is invalid.");
     if (!opt_all && opt_devices.length == 0)
-        exit_error("Need to specify at least one device or --all.");
+        error("Need to specify at least one device or --all.");
     if ((opt_ioctl != null || opt_script.length > 0 || opt_evemu_events.length > 0) &&
         (opt_all || opt_devices.length < 1))
-        exit_error("For recording ioctls or scripts you have to specify a command to run");
+        error("For recording ioctls or scripts you have to specify a command to run");
 
     // device dump mode
     if (opt_ioctl == null && opt_script.length == 0 && opt_evemu_events.length == 0) {
@@ -435,11 +444,11 @@ main (string[] args)
         preload = "";
     else
         preload = preload + ":";
-    Environment.set_variable("LD_PRELOAD", preload + "libumockdev-preload.so.0", true);
+    checked_setenv("LD_PRELOAD", preload + "libumockdev-preload.so.0");
 
     try {
         root_dir = DirUtils.make_tmp("umockdev.XXXXXX");
-        Environment.set_variable("UMOCKDEV_DIR", root_dir, true);
+        checked_setenv("UMOCKDEV_DIR", root_dir);
     } catch (FileError e) {
         error("Cannot create temporary directory: %s", e.message);
     }
@@ -461,9 +470,8 @@ main (string[] args)
     try {
         child_pid = spawn_process_under_test (opt_devices, child_watch_cb);
     } catch (Error e) {
-        stderr.printf ("Cannot run %s: %s\n", opt_devices[0], e.message);
         remove_dir (root_dir);
-        Process.exit (1);
+        error ("Cannot run %s: %s", opt_devices[0], e.message);
     }
 
     loop.run();

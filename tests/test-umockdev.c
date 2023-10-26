@@ -32,8 +32,10 @@
 #include <sys/socket.h>
 #include <sys/sysmacros.h>
 #include <sys/un.h>
+#include <sys/vfs.h>
 #include <linux/usbdevice_fs.h>
 #include <linux/input.h>
+#include <linux/magic.h>
 
 #include <libudev.h>
 #include <gudev/gudev.h>
@@ -47,6 +49,15 @@
 
 #define UNUSED __attribute__ ((unused))
 #define UNUSED_DATA UNUSED gconstpointer data
+
+/* avoid leak reports inside assertions; leaking stuff on assertion failures does not matter in tests */
+#if !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
+#pragma GCC diagnostic ignored "-Wanalyzer-file-leak"
+#pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
+#pragma GCC diagnostic ignored "-Wanalyzer-use-of-uninitialized-value"
+#pragma GCC diagnostic ignored "-Wanalyzer-fd-use-without-check"
+#endif
 
 static gboolean has_real_sysfs;
 
@@ -118,7 +129,7 @@ num_udev_devices(void)
 
     enumerate = udev_enumerate_new(udev);
     g_assert(enumerate);
-    
+
     // NB: using libudev here instead of GUdev so that we can check the return
     // value of udev_enumerate_scan_devices().
     // https://github.com/martinpitt/umockdev/issues/144
@@ -230,6 +241,7 @@ t_testbed_add_device(UMockdevTestbedFixture * fixture, UNUSED_DATA)
             /* attributes */
             "idVendor", "0815", "idProduct", "AFFE", NULL,
             /* properties */
+            "DEVTYPE", "usb_device", "DEVNAME", "/dev/mydev",
             "ID_INPUT", "1", "ID_INPUT_KEYBOARD", "1", NULL);
     g_assert(syspath);
     g_assert(g_str_has_suffix(syspath, "/sys/devices/extkeyboard1"));
@@ -240,6 +252,8 @@ t_testbed_add_device(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_assert(device != NULL);
     g_assert_cmpstr(udev_device_get_syspath(device), ==, syspath);
     g_assert_cmpstr(udev_device_get_action(device), ==, "add");
+    g_assert_cmpstr(udev_device_get_devnode(device), ==, "/dev/mydev");
+    g_assert_cmpstr(udev_device_get_devtype(device), ==, "usb_device");
     udev_device_unref(device);
     udev_monitor_unref(udev_mon);
     udev_unref(udev);
@@ -571,40 +585,6 @@ t_testbed_set_property(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_object_unref(device);
 }
 
-struct event_counter {
-    unsigned add;
-    unsigned remove;
-    unsigned change;
-    gchar last_device[1024];
-};
-
-static void
-on_uevent(UNUSED GUdevClient *client, const gchar *action, GUdevDevice *device, gpointer user_data)
-{
-    struct event_counter *counter = (struct event_counter *)user_data;
-
-    g_debug("on_uevent action %s device %s", action, g_udev_device_get_sysfs_path(device));
-
-    if (strcmp(action, "add") == 0)
-	counter->add++;
-    else if (strcmp(action, "remove") == 0)
-	counter->remove++;
-    else if (strcmp(action, "change") == 0)
-	counter->change++;
-    else
-	g_assert_not_reached();
-
-    strncpy(counter->last_device, g_udev_device_get_sysfs_path(device), sizeof(counter->last_device) - 1);
-}
-
-static gboolean
-on_timeout(gpointer user_data)
-{
-    GMainLoop *mainloop = (GMainLoop *) user_data;
-    g_main_loop_quit(mainloop);
-    return FALSE;
-}
-
 static void
 t_testbed_uevent_libudev(UMockdevTestbedFixture * fixture, UNUSED_DATA)
 {
@@ -642,12 +622,18 @@ t_testbed_uevent_libudev(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_assert(device != NULL);
     g_assert_cmpstr(udev_device_get_syspath(device), ==, syspath);
     g_assert_cmpstr(udev_device_get_action(device), ==, "add");
+    g_assert_cmpstr(udev_device_get_subsystem(device), ==, "pci");
+    g_assert_cmpstr(udev_device_get_sysattr_value(device, "idVendor"), ==, "0815");
+    g_assert_cmpstr(udev_device_get_property_value(device, "ID_INPUT"), ==, "1");
     udev_device_unref(device);
 
     device = udev_monitor_receive_device(kernel_mon);
     g_assert(device != NULL);
     g_assert_cmpstr(udev_device_get_syspath(device), ==, syspath);
     g_assert_cmpstr(udev_device_get_action(device), ==, "add");
+    g_assert_cmpstr(udev_device_get_subsystem(device), ==, "pci");
+    g_assert_cmpstr(udev_device_get_sysattr_value(device, "idVendor"), ==, "0815");
+    g_assert_cmpstr(udev_device_get_property_value(device, "ID_INPUT"), ==, "1");
     udev_device_unref(device);
 
     udev_monitor_unref(udev_mon);
@@ -665,7 +651,6 @@ t_testbed_uevent_libudev_filter(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     struct udev_monitor *mon;
     struct udev_device *device;
     const int num_events = 10;
-    int i;
 
     /* set up monitor */
     udev = udev_new();
@@ -677,20 +662,22 @@ t_testbed_uevent_libudev_filter(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_assert_cmpint(udev_monitor_filter_update(mon), ==, 0);
     g_assert_cmpint(udev_monitor_enable_receiving(mon), ==, 0);
 
-    g_autofree gchar *syspath = umockdev_testbed_add_device(
-            fixture->testbed, "pci", "mydev", NULL,
-            /* attributes */
-            "idVendor", "0815", NULL,
-            /* properties */
-            "ID_INPUT", "1", "DEVTYPE", "fancy", NULL);
-    g_assert(syspath);
+    gboolean success = umockdev_testbed_add_from_string(
+            fixture->testbed,
+            "P: /devices/mydev\n"
+            "E: SUBSYSTEM=pci\n"
+            "A: idVendor=0815\n"
+            "E: ID_INPUT=1\n"
+            "E: DEVTYPE=fancy\n", NULL);
+    g_assert (success);
+    const gchar *syspath = "/sys/devices/mydev";
 
     /* queue a bunch of events */
-    for (i = 0; i < num_events; ++i)
+    for (int i = 0; i < num_events; ++i)
         umockdev_testbed_uevent(fixture->testbed, syspath, "change");
 
     /* check that they are on the monitors */
-    /* first, the add event from add_device() */
+    /* first, the add event from add_from_string() */
     device = udev_monitor_receive_device(mon);
     g_assert(device != NULL);
     g_assert_cmpstr(udev_device_get_syspath(device), ==, syspath);
@@ -699,7 +686,7 @@ t_testbed_uevent_libudev_filter(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_assert_cmpstr(udev_device_get_devtype(device), ==, "fancy");
     udev_device_unref(device);
     /* now the change events */
-    for (i = 0; i < num_events; ++i) {
+    for (int i = 0; i < num_events; ++i) {
         device = udev_monitor_receive_device(mon);
         g_assert(device != NULL);
         g_assert_cmpstr(udev_device_get_syspath(device), ==, syspath);
@@ -713,6 +700,41 @@ t_testbed_uevent_libudev_filter(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     udev_monitor_unref(mon);
     udev_unref(udev);
 }
+
+struct event_counter {
+    unsigned add;
+    unsigned remove;
+    unsigned change;
+    gchar last_device[1024];
+};
+
+static void
+on_uevent(UNUSED GUdevClient *client, const gchar *action, GUdevDevice *device, gpointer user_data)
+{
+    struct event_counter *counter = (struct event_counter *)user_data;
+
+    g_debug("on_uevent action %s device %s", action, g_udev_device_get_sysfs_path(device));
+
+    if (strcmp(action, "add") == 0)
+	counter->add++;
+    else if (strcmp(action, "remove") == 0)
+	counter->remove++;
+    else if (strcmp(action, "change") == 0)
+	counter->change++;
+    else
+	g_assert_not_reached();
+
+    strncpy(counter->last_device, g_udev_device_get_sysfs_path(device), sizeof(counter->last_device) - 1);
+}
+
+static gboolean
+on_timeout(gpointer user_data)
+{
+    GMainLoop *mainloop = (GMainLoop *) user_data;
+    g_main_loop_quit(mainloop);
+    return FALSE;
+}
+
 
 static void
 t_testbed_uevent_gudev(UMockdevTestbedFixture * fixture, UNUSED_DATA)
@@ -830,10 +852,29 @@ t_testbed_uevent_action_overflow(UMockdevTestbedFixture * fixture, UNUSED_DATA)
 
     /* overly long action */
     if (g_test_subprocess()) {
-        char long_action[4096];
+        char long_action[16384];
         memset(long_action, 'a', sizeof(long_action));
         long_action[sizeof(long_action)-1] = '\0';
         umockdev_testbed_uevent(fixture->testbed, syspath, long_action);
+    }
+    g_test_trap_subprocess(NULL, 0, 0);
+    g_test_trap_assert_failed();
+    g_test_trap_assert_stderr ("*uevent_sender_send*Property buffer overflow*");
+}
+
+static void
+t_testbed_uevent_property_overflow(UMockdevTestbedFixture * fixture, UNUSED_DATA)
+{
+    /* overly long property */
+    if (g_test_subprocess()) {
+        char long_name[10000];
+        memset(long_name, 'a', sizeof long_name);
+        long_name[sizeof long_name - 1] = '\0';
+
+        /* this sends an "add" uevent */
+        umockdev_testbed_add_device(fixture->testbed, "pci", "mydev", NULL,
+                                    NULL, /* attributes */
+                                    long_name, long_name, NULL);
     }
     g_test_trap_subprocess(NULL, 0, 0);
     g_test_trap_assert_failed();
@@ -1031,6 +1072,8 @@ t_testbed_libc(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     char *path;
     char pathbuf[PATH_MAX];
     int dirfd, fd;
+    struct stat st;
+    uid_t uid = getuid();
 
     /* start with adding one device */
     success = umockdev_testbed_add_from_string(fixture->testbed,
@@ -1111,6 +1154,85 @@ t_testbed_libc(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_assert_cmpint(openat(AT_FDCWD, "sys/devices", O_RDONLY), <, 0);
     g_assert_cmpint(errno, ==, ENOENT);
     g_assert_cmpint(openat64(AT_FDCWD, "sys/devices", O_RDONLY), <, 0);
+
+    /* stat */
+    g_assert_cmpint(stat ("/sys/bus/pci/devices", &st), ==, 0);
+    g_assert_cmpint(st.st_nlink, >=, 1);
+    g_assert_cmpint(st.st_nlink, <=, 2);
+    g_assert_cmpuint(st.st_uid, ==, uid);
+    g_assert(S_ISDIR(st.st_mode));
+
+    g_assert_cmpint(lstat ("/sys/bus/pci/devices/dev1", &st), ==, 0);
+    g_assert_cmpuint(st.st_uid, ==, uid);
+    g_assert(S_ISLNK(st.st_mode));
+
+    g_assert_cmpint(stat ("/sys/bus/pci/devices/dev1", &st), ==, 0);
+    g_assert_cmpuint(st.st_uid, ==, uid);
+    g_assert(S_ISDIR(st.st_mode));
+
+    g_assert_cmpint(fstatat (AT_FDCWD, "/sys/bus/pci/devices", &st, 0), ==, 0);
+    g_assert_cmpuint(st.st_uid, ==, uid);
+    g_assert(S_ISDIR(st.st_mode));
+
+    g_assert_cmpint(fstatat (AT_FDCWD, "/sys/bus/pci/devices/dev1", &st, AT_SYMLINK_NOFOLLOW), ==, 0);
+    g_assert_cmpuint(st.st_uid, ==, uid);
+    g_assert(S_ISLNK(st.st_mode));
+
+    g_assert_cmpint(fstatat (AT_FDCWD, "/sys/bus/pci/devices/dev1", &st, 0), ==, 0);
+    g_assert_cmpuint(st.st_uid, ==, uid);
+    g_assert(S_ISDIR(st.st_mode));
+
+#ifdef __GLIBC__
+    /* statx */
+    struct statx stx;
+    g_assert_cmpint(statx (AT_FDCWD, "/sys/bus/pci/devices", 0, STATX_TYPE|STATX_NLINK|STATX_UID, &stx), ==, 0);
+    g_assert_cmpint(stx.stx_nlink, >=, 1);
+    g_assert_cmpint(stx.stx_nlink, <=, 2);
+    g_assert_cmpuint(stx.stx_uid, ==, uid);
+    g_assert(S_ISDIR(stx.stx_mode));
+
+    g_assert_cmpint(statx (AT_FDCWD, "/sys/bus/pci/devices/dev1", AT_SYMLINK_NOFOLLOW, STATX_TYPE|STATX_NLINK|STATX_UID, &stx), ==, 0);
+    g_assert_cmpuint(stx.stx_uid, ==, uid);
+    g_assert(S_ISLNK(stx.stx_mode));
+
+    g_assert_cmpint(statx (AT_FDCWD, "/sys/bus/pci/devices/dev1", 0, STATX_TYPE|STATX_NLINK|STATX_UID, &stx), ==, 0);
+    g_assert_cmpuint(stx.stx_uid, ==, uid);
+    g_assert(S_ISDIR(stx.stx_mode));
+
+    struct statfs buf;
+    dirfd = open("/sys", O_RDONLY | O_DIRECTORY);
+    g_assert_cmpint(dirfd, >=, 0);
+    g_assert_cmpint(fstatfs(dirfd, &buf), ==, 0);
+    g_assert_cmpint(buf.f_type, ==, SYSFS_MAGIC);
+    close (dirfd);
+    memset(&buf, 0, sizeof buf);
+
+    dirfd = open("/sys/bus/pci/devices/dev1", O_RDONLY | O_DIRECTORY);
+    g_assert_cmpint(dirfd, >=, 0);
+    g_assert_cmpint(fstatfs(dirfd, &buf), ==, 0);
+    g_assert_cmpint(buf.f_type, ==, SYSFS_MAGIC);
+    close (dirfd);
+    memset(&buf, 0, sizeof buf);
+
+    dirfd = open("/dev", O_RDONLY | O_DIRECTORY);
+    g_assert_cmpint(dirfd, >=, 0);
+    g_assert_cmpint(fstatfs(dirfd, &buf), ==, 0);
+    g_assert_cmpint(buf.f_type, !=, SYSFS_MAGIC);
+    close (dirfd);
+    memset(&buf, 0, sizeof buf);
+
+    g_assert_cmpint(statfs("/sys", &buf), ==, 0);
+    g_assert_cmpint(buf.f_type, ==, SYSFS_MAGIC);
+    memset(&buf, 0, sizeof buf);
+
+    g_assert_cmpint(statfs("/sys/bus/pci/devices/dev1", &buf), ==, 0);
+    g_assert_cmpint(buf.f_type, ==, SYSFS_MAGIC);
+    memset(&buf, 0, sizeof buf);
+
+    g_assert_cmpint(statfs("/dev", &buf), ==, 0);
+    g_assert_cmpint(buf.f_type, !=, SYSFS_MAGIC);
+    memset(&buf, 0, sizeof buf);
+#endif
 }
 
 static void
@@ -1172,6 +1294,7 @@ t_testbed_dev_access(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     int fd;
     FILE* f;
     char buf[100];
+    uid_t uid = getuid();
 
     /* no mocked devices */
     g_assert_cmpint(g_open("/dev/wishyouwerehere", O_RDONLY, 0), ==, -1);
@@ -1198,8 +1321,23 @@ t_testbed_dev_access(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_assert_cmpint(g_open("/dev/wishyouwerehere", O_RDONLY, 0), ==, -1);
     g_assert_cmpint(errno, ==, ENOENT);
     g_assert_cmpint(g_stat("/dev/zero", &st), ==, 0);
+    g_assert_cmpuint(st.st_uid, ==, uid);
     g_assert(S_ISCHR(st.st_mode));
     g_assert_cmpint(st.st_rdev, ==, 0);	/* we did not set anything */
+
+    memset(&st, 42, sizeof st);
+    g_assert_cmpint(fstatat(AT_FDCWD, "/dev/zero", &st, 0), ==, 0);
+    g_assert_cmpuint(st.st_uid, ==, uid);
+    g_assert(S_ISCHR(st.st_mode));
+    g_assert_cmpint(st.st_rdev, ==, 0);	/* we did not set anything */
+
+#ifdef __GLIBC__
+    struct statx stx;
+    g_assert_cmpint(statx (AT_FDCWD, "/dev/zero", 0, STATX_TYPE|STATX_UID, &stx), ==, 0);
+    g_assert_cmpuint(stx.stx_uid, ==, uid);
+    g_assert(S_ISCHR(stx.stx_mode));
+#endif
+
     fd = g_open("/dev/zero", O_RDONLY, 0);
     g_assert_cmpint(fd, >, 0);
     g_assert(!isatty(fd));
@@ -1352,6 +1490,18 @@ t_testbed_add_from_string_dev_block(UMockdevTestbedFixture * fixture, UNUSED_DAT
     g_assert_cmpint(g_stat("/dev/empty", &st), ==, 0);
     g_assert(S_ISBLK(st.st_mode));
 
+    memset(&st, 42, sizeof st);
+    g_assert_cmpint(fstatat(AT_FDCWD, "/dev/empty", &st, 0), ==, 0);
+    g_assert_cmpuint(st.st_uid, ==, getuid());
+    g_assert(S_ISBLK(st.st_mode));
+
+#ifdef __GLIBC__
+    struct statx stx;
+    g_assert_cmpint(statx (AT_FDCWD, "/dev/empty", 0, STATX_TYPE|STATX_UID, &stx), ==, 0);
+    g_assert_cmpuint(stx.stx_uid, ==, getuid());
+    g_assert(S_ISBLK(stx.stx_mode));
+#endif
+
     /* N: with value should set that contents */
     g_assert(umockdev_testbed_add_from_string(fixture->testbed,
 					      "P: /devices/block/filled\n"
@@ -1366,6 +1516,12 @@ t_testbed_add_from_string_dev_block(UMockdevTestbedFixture * fixture, UNUSED_DAT
     g_free(contents);
     g_assert_cmpint(g_stat("/dev/sdf", &st), ==, 0);
     g_assert(S_ISBLK(st.st_mode));
+
+#ifdef __GLIBC__
+    g_assert_cmpint(statx (AT_FDCWD, "/dev/sdf", 0, STATX_TYPE|STATX_UID, &stx), ==, 0);
+    g_assert_cmpuint(stx.stx_uid, ==, getuid());
+    g_assert(S_ISBLK(stx.stx_mode));
+#endif
 }
 
 static void
@@ -1379,12 +1535,14 @@ t_testbed_dev_query_gudev(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_assert(umockdev_testbed_add_from_string(fixture->testbed,
 					      "P: /devices/stream\nN: stream\n"
 					      "E: SUBSYSTEM=foo\nE: DEVNAME=/dev/stream\n"
+					      "E: MAJOR=4\nE: MINOR=1\n"
 					      "A: dev=4:1\n", &error));
     g_assert_no_error(error);
 
     g_assert(umockdev_testbed_add_from_string(fixture->testbed,
 					      "P: /devices/block/disk\nN: disk\n"
 					      "E: SUBSYSTEM=block\nE: DEVNAME=/dev/disk\n"
+					      "E: MAJOR=8\nE: MINOR=1\n"
 					      "A: dev=8:1\n", &error));
     g_assert_no_error(error);
 
@@ -2208,6 +2366,8 @@ main(int argc, char **argv)
 	       t_testbed_uevent_null_action, t_testbed_fixture_teardown);
     g_test_add("/umockdev-testbed/uevent/action_overflow", UMockdevTestbedFixture, NULL, t_testbed_fixture_setup,
 	       t_testbed_uevent_action_overflow, t_testbed_fixture_teardown);
+    g_test_add("/umockdev-testbed/uevent/property_overflow", UMockdevTestbedFixture, NULL, t_testbed_fixture_setup,
+	       t_testbed_uevent_property_overflow, t_testbed_fixture_teardown);
 
     /* tests for mocking USB devices */
     g_test_add("/umockdev-testbed-usb/lsusb", UMockdevTestbedFixture, NULL, t_testbed_fixture_setup,
