@@ -20,6 +20,11 @@
 
 using UMockdevUtils;
 using Assertions;
+using GLibc;
+
+#if HAVE_SELINUX
+using Selinux;
+#endif
 
 string rootdir;
 
@@ -193,6 +198,53 @@ t_testbed_fs_ops ()
 
   assert_cmpint (Posix.chdir (orig_cwd), CompareOperator.EQ, 0);
 }
+
+#if HAVE_SELINUX
+void
+t_testbed_selinux ()
+{
+  int exit;
+  try {
+      Process.spawn_command_line_sync ("command -v selinuxenabled", null, null, out exit);
+  } catch (SpawnError e) {
+      exit = 1;
+  }
+  if (exit != 0) {
+      stdout.printf ("[SKIP SELinux not active]\n");
+      return;
+  }
+
+  var tb = new UMockdev.Testbed ();
+
+  // valid context
+  tb_add_from_string (tb, """P: /devices/myusbhub/cam
+N: bus/usb/001/002
+E: SUBSYSTEM=usb
+E: DEVTYPE=usb_device
+E: DEVNAME=/dev/bus/usb/001/002
+E: __DEVCONTEXT=system_u:object_r:device_t:s0
+""");
+
+  string context;
+  assert_cmpint (Selinux.lgetfilecon ("/dev/bus/usb/001/002", out context), CompareOperator.GT, 0);
+  assert_cmpstr (context, CompareOperator.EQ, "system_u:object_r:device_t:s0");
+
+  // invalidly context
+  tb_add_from_string (tb, """P: /devices/invalidcontext
+N: invalidcontext
+E: SUBSYSTEM=tty
+E: DEVNAME=/dev/invalidcontext
+E: __DEVCONTEXT=blah
+""");
+
+  assert (FileUtils.test("/dev/invalidcontext", FileTest.EXISTS));
+  string root_context;
+  assert_cmpint (Selinux.lgetfilecon (tb.get_root_dir(), out root_context), CompareOperator.GT, 0);
+  assert_cmpint (Selinux.lgetfilecon ("/dev/invalidcontext", out context), CompareOperator.GT, 0);
+  // has default context
+  assert_cmpstr (context, CompareOperator.EQ, root_context);
+}
+#endif
 
 void
 t_usbfs_ioctl_static ()
@@ -504,6 +556,13 @@ t_usbfs_ioctl_pcap ()
   string device;
   Ioctl.usbdevfs_urb* urb_reap = null;
 
+  GLibc.Utsname utsbuf;
+  GLibc.uname (out utsbuf);
+  if (utsbuf.machine ==  "sparc64") {
+      stdout.printf ("[SKIP pre-recorded pcap does not work on sparc64]\n");
+      return;
+  }
+
   /* NOTE: This test is a bit ugly. It wasn't the best idea to use a USB keyboard. */
 
   checked_file_get_contents (Path.build_filename(rootdir + "/devices/input/usbkbd.pcap.umockdev"), out device);
@@ -651,6 +710,7 @@ t_spidev_ioctl ()
   tx_buf[1] = 0xff;
 
   Posix.memset (xfer, 0, sizeof (Ioctl.spi_ioc_transfer) * 2);
+  /* these casts are evil, bad, and wrong -- but that's how Linux defines them, even 32 bit platforms have u64 */
   xfer[0].tx_buf = (uint64) tx_buf;
   xfer[0].len = 2;
   xfer[1].rx_buf = (uint64) rx_buf;
@@ -718,6 +778,56 @@ t_hidraw_ioctl ()
 	  0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x40, 0x91, 0x02, 0xC0
   };
   assert_cmpint (Posix.memcmp(desc.value, desc_value, 34), CompareOperator.EQ, 0);
+  Posix.close (fd);
+}
+
+void
+t_cros_ec_ioctl ()
+{
+  var tb = new UMockdev.Testbed ();
+
+  string device;
+  checked_file_get_contents (Path.build_filename(rootdir + "/devices/cros_ec/crosfingerprint.umockdev"), out device);
+  tb_add_from_string (tb, device);
+
+  try {
+      tb.load_ioctl ("/dev/cros_fp", Path.build_filename(rootdir + "/devices/cros_ec/crosfingerprint.ioctl"));
+  } catch (Error e) {
+      error ("Cannot load ioctl file: %s", e.message);
+  }
+
+  int fd = Posix.open ("/dev/cros_fp", Posix.O_RDWR, 0);
+  assert_cmpint (fd, CompareOperator.GE, 0);
+
+  Ioctl.cros_ec_command_v2 *s_cmd = malloc (sizeof (Ioctl.cros_ec_command_v2) + 4);
+  assert_cmpint (Posix.ioctl (fd, Ioctl.CROS_EC_DEV_IOCXCMD_V2, s_cmd), CompareOperator.EQ, 4);
+  assert_cmpint (Posix.errno, CompareOperator.EQ, 0);
+  uint8 fpmode_data[] = {
+    0x80, 0x00, 0x00, 0x00
+  };
+  assert_cmpint (Posix.memcmp(s_cmd->data, fpmode_data, 4), CompareOperator.EQ, 0);
+
+  s_cmd = realloc(s_cmd, sizeof (Ioctl.cros_ec_command_v2) + 48);
+  assert_cmpint (Posix.ioctl (fd, Ioctl.CROS_EC_DEV_IOCXCMD_V2, s_cmd), CompareOperator.EQ, 48);
+  assert_cmpint (Posix.errno, CompareOperator.EQ, 0);
+  uint8 fpinfo_data[] = {
+    0x46, 0x50, 0x43, 0x20, 0x09, 0x00, 0x00, 0x00, 0x1B, 0x02, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x94, 0x66, 0x00, 0x00, 0x47, 0x52, 0x45, 0x59,
+    0xA0, 0x00, 0xA0, 0x00, 0x08, 0x00, 0xFF, 0x03, 0x24, 0x14, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00
+  };
+  assert_cmpint (Posix.memcmp(s_cmd->data, fpinfo_data, 48), CompareOperator.EQ, 0);
+
+  s_cmd = realloc(s_cmd, sizeof (Ioctl.cros_ec_command_v2) + 22);
+  assert_cmpint (Posix.ioctl (fd, Ioctl.CROS_EC_DEV_IOCXCMD_V2, s_cmd), CompareOperator.EQ, 22);
+  assert_cmpint (Posix.errno, CompareOperator.EQ, 0);
+  uint8 fpstats_data[] = {
+    0x65, 0x63, 0x01, 0x00, 0xB4, 0x4A, 0x02, 0x00, 0x07, 0xB3, 0x03, 0x00,
+    0xDC, 0x33, 0x50, 0x5A, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00
+  };
+  assert_cmpint (Posix.memcmp(s_cmd->data, fpstats_data, 22), CompareOperator.EQ, 0);
+
+  free (s_cmd);
   Posix.close (fd);
 }
 
@@ -825,7 +935,7 @@ is_test_inside_testbed (int pipefd)
     if (UMockdev.in_mock_environment())
         buf[0] = '1';
 
-    Posix.write(pipefd, buf, 1);
+    assert_cmpint ((int) Posix.write(pipefd, buf, 1), CompareOperator.EQ, 1);
     return int.parse((string) buf);
 }
 
@@ -1076,6 +1186,9 @@ main (string[] args)
   Test.add_func ("/umockdev-testbed-vala/add_devicev", t_testbed_add_device);
   Test.add_func ("/umockdev-testbed-vala/gudev-query-list", t_testbed_gudev_query_list);
   Test.add_func ("/umockdev-testbed-vala/fs_ops", t_testbed_fs_ops);
+#if HAVE_SELINUX
+  Test.add_func ("/umockdev-testbed-vala/selinux", t_testbed_selinux);
+#endif
 
   /* tests for mocking ioctls */
   Test.add_func ("/umockdev-testbed-vala/usbfs_ioctl_static", t_usbfs_ioctl_static);
@@ -1089,6 +1202,8 @@ main (string[] args)
   Test.add_func ("/umockdev-testbed-vala/spidev_ioctl", t_spidev_ioctl);
 
   Test.add_func ("/umockdev-testbed-vala/hidraw_ioctl", t_hidraw_ioctl);
+
+  Test.add_func ("/umockdev-testbed-vala/cros_ec_ioctl", t_cros_ec_ioctl);
 
   /* tests for mocking TTYs */
   Test.add_func ("/umockdev-testbed-vala/tty_stty", t_tty_stty);

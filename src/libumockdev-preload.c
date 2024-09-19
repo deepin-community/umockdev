@@ -22,11 +22,29 @@
  * along with umockdev; If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* override -D_FILE_OFFSET_BITS, it breaks us */
-#undef _FILE_OFFSET_BITS
-
 /* for getting stat64 */
 #define _GNU_SOURCE
+
+#include <features.h>
+
+#ifdef __GLIBC__
+/* Remove gcc asm aliasing so that our interposed symbols work as expected */
+#include <sys/cdefs.h>
+
+#include <stddef.h>
+extern int __REDIRECT_NTH (__ttyname_r_alias, (int __fd, char *__buf,
+                                               size_t __buflen), ttyname_r);
+
+#ifdef __REDIRECT
+#undef __REDIRECT
+#endif
+#define __REDIRECT(name, proto, alias) name proto
+#ifdef __REDIRECT_NTH
+#undef __REDIRECT_NTH
+#endif
+#define __REDIRECT_NTH(name, proto, alias) name proto __THROW
+
+#endif /* __GLIBC__ */
 
 #include <assert.h>
 #include <errno.h>
@@ -62,6 +80,23 @@
 #include "debug.h"
 #include "utils.h"
 #include "ioctl_tree.h"
+
+#ifdef __GLIBC__
+
+/* __USE_TIME64_REDIRECTS was introduced in glibc 2.39.9. With older releases we need to look at
+ * __USE_TIME_BITS64 instead, but the latter is always defined in 2.39.9 now. So make some guesswork
+ * and define the former when appropriate. */
+#if !defined(__USE_TIME64_REDIRECTS) && defined(__USE_TIME_BITS64) && __TIMESIZE == 32
+#pragma message "Defining backwards compatibility shim __USE_TIME64_REDIRECTS for glibc < 2.39.9"
+#define __USE_TIME64_REDIRECTS 1
+#endif
+
+/* Fixup for making a mess with __REDIRECT above */
+#ifdef __USE_TIME64_REDIRECTS
+#define clock_gettime __clock_gettime64
+extern int clock_gettime(clockid_t clockid, struct timespec *tp);
+#endif
+#endif
 
 /* fix missing O_TMPFILE on some systems */
 #ifndef O_TMPFILE
@@ -140,13 +175,13 @@ pthread_mutex_t ioctl_lock = PTHREAD_MUTEX_INITIALIZER;
     do { \
         sigset_t sig_set; \
         sigfillset(&sig_set); \
-        pthread_sigmask(SIG_SETMASK, &sig_set, &trap_path_sig_restore); \
         pthread_mutex_lock (&trap_path_lock); \
+        pthread_sigmask(SIG_SETMASK, &sig_set, &trap_path_sig_restore); \
     } while (0)
 #define TRAP_PATH_UNLOCK \
     do { \
-        pthread_mutex_unlock (&trap_path_lock); \
         pthread_sigmask(SIG_SETMASK, &trap_path_sig_restore, NULL); \
+        pthread_mutex_unlock (&trap_path_lock); \
     } while (0)
 
 #define IOCTL_LOCK pthread_mutex_lock (&ioctl_lock)
@@ -1213,6 +1248,8 @@ rettype name(const char *path, arg2t arg2, arg3t arg3, arg4t arg4) \
  * the emulated /dev to indicate a block device (the sticky bit has no
  * real functionality for device nodes) */
 #define WRAP_STAT(prefix, suffix) \
+extern int prefix ## stat ## suffix (const char *path, \
+                                     struct stat ## suffix *st); \
 int prefix ## stat ## suffix (const char *path, struct stat ## suffix *st) \
 { \
     const char *p;								\
@@ -1233,6 +1270,8 @@ int prefix ## stat ## suffix (const char *path, struct stat ## suffix *st) \
 
 /* wrapper template for fstatat family */
 #define WRAP_FSTATAT(prefix, suffix) \
+extern int prefix ## fstatat ## suffix (int dirfd, const char *path, \
+                                        struct stat ## suffix *st, int flags); \
 int prefix ## fstatat ## suffix (int dirfd, const char *path, struct stat ## suffix *st, int flags) \
 { \
     const char *p;								\
@@ -1390,6 +1429,12 @@ WRAP_STAT(,64);
 WRAP_STAT(l,64);
 WRAP_FSTATAT(,64);
 WRAP_FOPEN(,64);
+#if defined(__USE_FILE_OFFSET64) && defined(__USE_TIME64_REDIRECTS)
+#define stat64_time64 stat64
+WRAP_STAT(__,64_time64);
+WRAP_STAT(__l,64_time64);
+WRAP_FSTATAT(__,64_time64);
+#endif
 #endif
 
 WRAP_3ARGS(ssize_t, -1, readlink, char *, size_t);
@@ -1444,6 +1489,8 @@ int statx(int dirfd, const char *pathname, int flags, unsigned mask, struct stat
     return r;
 }
 
+#endif /* __GLIBC__ */
+
 static bool is_dir_or_contained(const char *path, const char *dir, const char *subdir)
 {
     if (!path || !dir)
@@ -1490,7 +1537,9 @@ int fstatfs ## suffix(int fd, struct statfs ## suffix *buf)	\
 }
 
 WRAP_FSTATFS();
+#ifdef __GLIBC__
 WRAP_FSTATFS(64);
+#endif
 
 #define WRAP_STATFS(suffix) \
 int statfs ## suffix(const char *path, struct statfs ## suffix *buf) {	\
@@ -1512,8 +1561,8 @@ int statfs ## suffix(const char *path, struct statfs ## suffix *buf) {	\
 }
 
 WRAP_STATFS();
+#ifdef __GLIBC__
 WRAP_STATFS(64);
-
 #endif
 
 int __open_2(const char *path, int flags);
@@ -1755,6 +1804,18 @@ recvmsg(int sockfd, struct msghdr * msg, int flags)
     return ret;
 }
 
+extern ssize_t __recvmsg64(int sockfd, struct msghdr * msg, int flags);
+ssize_t
+__recvmsg64(int sockfd, struct msghdr * msg, int flags)
+{
+    libc_func(__recvmsg64, int, int, struct msghdr *, int);
+    ssize_t ret = ___recvmsg64(sockfd, msg, flags);
+
+    netlink_recvmsg(sockfd, msg, ret);
+
+    return ret;
+}
+
 int
 socket(int domain, int type, int protocol)
 {
@@ -1871,6 +1932,42 @@ ioctl(int d, IOCTL_REQUEST_TYPE request, ...)
 
     return result;
 }
+
+#ifdef __GLIBC__
+
+extern int __ioctl_time64 (int __fd, unsigned long int __request, ...) __THROW;
+int
+__ioctl_time64(int d, IOCTL_REQUEST_TYPE request, ...)
+{
+    libc_func(__ioctl_time64, int, int, IOCTL_REQUEST_TYPE, ...);
+    int result;
+    va_list ap;
+    void* arg;
+
+    /* one cannot reliably forward arbitrary varargs
+     * (http://c-faq.com/varargs/handoff.html), but we know that ioctl gets at
+     * most one extra argument, and almost all of them are pointers or ints,
+     * both of which fit into a void*.
+     */
+    va_start(ap, request);
+    arg = va_arg(ap, void*);
+    va_end(ap);
+
+    result = remote_emulate(d, IOCTL_REQ_IOCTL, (unsigned int) request, (long) arg);
+    if (result != UNHANDLED) {
+	DBG(DBG_IOCTL, "ioctl fd %i request %X: emulated, result %i\n", d, (unsigned) request, result);
+	return result;
+    }
+
+    /* fallback to call original ioctl */
+    result = ___ioctl_time64(d, request, arg);
+    DBG(DBG_IOCTL, "ioctl fd %i request %X: original, result %i\n", d, (unsigned) request, result);
+
+    return result;
+}
+
+#endif /* __GLIBC__ */
+
 
 int
 isatty(int fd)

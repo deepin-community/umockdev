@@ -50,15 +50,6 @@
 #define UNUSED __attribute__ ((unused))
 #define UNUSED_DATA UNUSED gconstpointer data
 
-/* avoid leak reports inside assertions; leaking stuff on assertion failures does not matter in tests */
-#if !defined(__clang__)
-#pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
-#pragma GCC diagnostic ignored "-Wanalyzer-file-leak"
-#pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
-#pragma GCC diagnostic ignored "-Wanalyzer-use-of-uninitialized-value"
-#pragma GCC diagnostic ignored "-Wanalyzer-fd-use-without-check"
-#endif
-
 static gboolean has_real_sysfs;
 
 static int slow_testbed_factor = 1;
@@ -1131,11 +1122,13 @@ t_testbed_libc(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_assert_cmpint(fd, >=, 0);
     close(fd);
 
+#ifdef HAVE_OPENAT64
     fd = openat64(dirfd, "sys/devices/dev1/simple_attr", O_RDONLY);
     if (fd < 0)
         perror("openat64");
     g_assert_cmpint(fd, >=, 0);
     close(fd);
+#endif
 
     close(dirfd);
 
@@ -1146,7 +1139,7 @@ t_testbed_libc(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_assert_cmpint(openat(dirfd, "sys", O_RDONLY), <, 0);
     g_assert_cmpint(errno, ==, ENOENT);
 
-    g_assert_cmpint(errno, ==, ENOENT);
+#ifdef HAVE_OPENAT64
     g_assert_cmpint(openat64(dirfd, "sys", O_RDONLY), <, 0);
     close(dirfd);
 
@@ -1154,6 +1147,7 @@ t_testbed_libc(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     g_assert_cmpint(openat(AT_FDCWD, "sys/devices", O_RDONLY), <, 0);
     g_assert_cmpint(errno, ==, ENOENT);
     g_assert_cmpint(openat64(AT_FDCWD, "sys/devices", O_RDONLY), <, 0);
+#endif
 
     /* stat */
     g_assert_cmpint(stat ("/sys/bus/pci/devices", &st), ==, 0);
@@ -1394,7 +1388,7 @@ t_testbed_dev_access(UMockdevTestbedFixture * fixture, UNUSED_DATA)
     /* open() with O_TMPFILE; this hasn't been supported in Linux for very long
      * (>= 3.11), so check that it works in the testbed only if it also works
      * in the "normal" file system. */
-    fd = g_open("/tmp", O_TMPFILE|O_RDWR, 0644);
+    fd = g_open(g_get_tmp_dir(), O_TMPFILE|O_RDWR, 0644);
     if (fd >= 0) {
         close(fd);
         errno = 0;
@@ -1575,7 +1569,12 @@ t_testbed_script_replay_evdev_event_framing(UMockdevTestbedFixture * fixture, UN
   int fd;
   char buf[1024];
 
+#if __BITS_PER_LONG != 32 || !defined(__USE_TIME_BITS64)
   struct timeval dummy = {0};
+#else
+  __kernel_ulong_t dummy = 0;
+#endif
+
   /* Simple evdev stream - x coordinate followed by SYN, times 2 */
   struct input_event dummy_events[] = {
       {dummy, 0003, 0000, 2534},

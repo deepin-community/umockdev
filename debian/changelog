@@ -1,3 +1,54 @@
+umockdev (0.18.4-1) unstable; urgency=medium
+
+  * Add git-buildpackage configuration. In particular, enable pristine-tar.
+  * New upstream bug fix release:
+    - Add ioctls for Chromium OS EC devices (thanks Abhinav Baid)
+    - Generate "remove" uevent in umockdev_testbed_remove_device()
+      (thanks Bob Henz)
+    - Recursively remove children with uevents (thanks Bob Henz)
+    - preload: Fix sigmask block and restore race (thanks barath)
+
+ -- Martin Pitt <mpitt@debian.org>  Wed, 04 Sep 2024 07:55:20 +0200
+
+umockdev (0.18.3-1) unstable; urgency=medium
+
+  * New upstream release:
+    - preload: Re-fix time64 redirects for glibc < 2.39.9
+
+ -- Martin Pitt <mpitt@debian.org>  Thu, 23 May 2024 09:57:53 +0200
+
+umockdev (0.18.2-1) unstable; urgency=medium
+
+  * New upstream release:
+    - preload: Fix time64 redirect for glibc 2.39.9
+  * Bump Standards-Version to 4.7.0. No changes necessary.
+
+ -- Martin Pitt <mpitt@debian.org>  Tue, 21 May 2024 07:09:20 +0200
+
+umockdev (0.18.1-1) unstable; urgency=medium
+
+  * New upstream release:
+    - preload: Provide wrappers for functions specific to 64-bit time_t (thanks Steve Langasek)
+    - preload: Fix building with _FILE_OFFSET_BITS (thanks Zixing Liu and Steve Langasek)
+    - tests: Skip usbfs_ioctl_pcap on sparc64 (fixes FTBFS)
+    - Closes: #1067208
+
+ -- Martin Pitt <mpitt@debian.org>  Sun, 24 Mar 2024 11:54:21 +0100
+
+umockdev (0.18.0-1) unstable; urgency=medium
+
+  * New upstream release:
+    - Record and restore SELinux context for mocked /dev nodes
+    - preload: wrap fstatfs() and statfs() on musl
+    - Fix build with meson 1.4
+  * Update pkg-config → pkgconf build dependency.
+    The former is a transitional name.
+  * Explicitly add gobject-introspection-bin build dependency.
+    Fixes "missing-build-dependency-for-dh-addon gir" lintian error.
+    gobject-introspection already depends on it, so it's a no-op.
+
+ -- Martin Pitt <mpitt@debian.org>  Sun, 03 Mar 2024 08:45:30 +0100
+
 umockdev (0.17.18-1) unstable; urgency=medium
 
   * New upstream bug fix release:
